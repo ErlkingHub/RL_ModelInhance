@@ -1,3 +1,10 @@
+# My Python.gitignore template
+*dataset*
+runs/
+checkpoints/
+*results/
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
