@@ -16,6 +16,7 @@ from mkp_config import (CHECKPOINT_VERSION, DECODER_VERSION, ModelConfig, Genera
 from mkp_data import synthetic_batch
 from mkp_env import MKPEnv, MKPState
 from mkp_Model import MKPModel
+from mkp_diagnostics import create_training_diagnostics, critic_diagnostics
 from mkp_utils import (atomic_checkpoint, construct_solution, load_checkpoint, resolve_device,
                        seed_everything, write_json)
 
@@ -39,12 +40,19 @@ def collect_rollout(model, data):
     env = MKPEnv(*data)
     records = {key: [] for key in ("remaining", "selected", "actions", "log_probs",
                                   "values", "rewards", "dones", "active")}
+    diagnostic_sum = torch.zeros(7, device=data[0].device)
+    diagnostic_count = torch.zeros((), device=data[0].device)
     model.eval()  # no dropout anywhere: collection and PPO recomputation agree
     for _ in range(data[0].shape[1]):
         active = env.state.active
         if not active.any():
             break
-        policy, value, _, _ = model(env.state)
+        policy, value, theta, _ = model(env.state)
+        diagnostics = torch.stack((policy.entropy(), policy.normalized_entropy(),
+            theta.profit_exponent, theta.scarcity_exponent, theta.bottleneck_weight,
+            theta.temperature, theta.resource_prices.std(-1, unbiased=False)), dim=-1)
+        diagnostic_sum += (diagnostics * active[:, None]).sum(0)
+        diagnostic_count += active.sum()
         actions = policy.choose(stochastic=True)
         records["remaining"].append(env.state.remaining.clone())
         records["selected"].append(env.state.selected.clone())
@@ -62,6 +70,11 @@ def collect_rollout(model, data):
     result = {k: torch.stack(v) for k, v in records.items()}
     result["objective"] = env.objective
     result["utilization"] = (1 - env.state.remaining / env.state.capacities).mean()
+    result["diagnostics"] = dict(zip(
+        ("rollout_entropy_raw", "rollout_entropy", "theta_alpha", "theta_beta",
+         "theta_kappa", "theta_temperature", "theta_price_std"),
+        (diagnostic_sum / diagnostic_count.clamp_min(1)).tolist()))
+    result["diagnostics"]["selected_fraction"] = env.state.selected.float().mean().item()
     return result
 
 
@@ -87,6 +100,10 @@ class MKPTrainer:
                        "entropy", "approx_kl", "clip_fraction", "grad_norm", "explained_variance",
                        "minibatches", "kl_stopped", "validation_return", "validation_improvement_pct",
                        "best_validation_return", "elapsed_seconds"]
+        self.fields += ["total_loss", "entropy_raw", "rollout_entropy", "rollout_entropy_raw",
+                        "stop_kl", "ppo_update_fraction", "critic_mc_rmse", "critic_mc_ev",
+                        "selected_fraction", "theta_alpha", "theta_beta", "theta_kappa",
+                        "theta_temperature", "theta_price_std"]
         with (self.run_dir / "metrics.csv").open("w", newline="", encoding="utf-8") as f:
             csv.DictWriter(f, fieldnames=self.fields).writeheader()
         write_json(self.run_dir / "config.json", {
@@ -107,8 +124,9 @@ class MKPTrainer:
         actions = rollout["actions"][times, batches]
         model.train()
         sums = {k: 0.0 for k in ("policy_loss", "value_loss", "constraint_aux_loss", "entropy",
-                                "approx_kl", "clip_fraction", "grad_norm")}
+                                "approx_kl", "clip_fraction", "grad_norm", "total_loss", "entropy_raw")}
         minibatches, observations, stopped = 0, 0, False
+        stop_kl = None
         for _ in range(c.ppo_epochs):
             order = torch.randperm(times.numel(), device=self.device)
             for ids in order.split(c.minibatch_size):
@@ -123,6 +141,7 @@ class MKPTrainer:
                     raise FloatingPointError("Non-finite PPO probability ratio")
                 if approximate_kl.item() > c.target_kl:
                     stopped = True
+                    stop_kl = approximate_kl.item()
                     break
                 surrogate = ratio * normalized_adv[ids]
                 clipped = ratio.clamp(1 - c.clip_ratio, 1 + c.clip_ratio) * normalized_adv[ids]
@@ -142,7 +161,8 @@ class MKPTrainer:
                                                           error_if_nonfinite=True)
                 optimizer.step()
                 metrics = (policy_loss, value_loss, constraint_loss, entropy, approximate_kl,
-                           ((ratio - 1).abs() > c.clip_ratio).float().mean(), grad_norm)
+                           ((ratio - 1).abs() > c.clip_ratio).float().mean(), grad_norm,
+                           loss, policy.entropy().mean())
                 for key, val in zip(sums, metrics):
                     sums[key] += val.detach().item() * ids.numel()
                 observations += ids.numel()
@@ -153,7 +173,18 @@ class MKPTrainer:
         explained = (1 - (targets - old_values).var(unbiased=False) / variance).item() if variance > 1e-12 else float("nan")
         result = {k: v / max(1, observations) for k, v in sums.items()}
         result.update(minibatches=minibatches, kl_stopped=int(stopped), explained_variance=explained)
+        result.update(stop_kl=stop_kl, ppo_update_fraction=observations / (c.ppo_epochs * times.numel()))
+        result.update(critic_diagnostics(rollout["rewards"], rollout["values"],
+                                         rollout["dones"], rollout["active"], c.gamma))
         return result
+
+    def _plot(self):
+        """Plot persisted CSV only; failures do not discard trained weights or log rows."""
+        try:
+            create_training_diagnostics(self.run_dir, self.config.plot_smoothing_window,
+                                        self.config.plot_dpi)
+        except Exception:
+            self.logger.exception("Training plots failed; metrics.csv remains available for offline plotting")
 
     def train(self, resume=None):
         if resume is not None and len(self.config.num_resources) != 1:
@@ -162,6 +193,7 @@ class MKPTrainer:
             for m in self.config.num_resources:
                 self._train_shape(m, resume)
         finally:
+            self._plot()
             for handler in self.logger.handlers[:]:
                 handler.close()
                 self.logger.removeHandler(handler)
@@ -176,8 +208,9 @@ class MKPTrainer:
         saved = None
         if resume:
             model, saved = load_checkpoint(resume, self.device, m)
-            if saved["model_config"] != config_dict(self.model_config):
-                raise ValueError("Resume model config differs; supply the original model settings")
+            if config_dict(model.config) != config_dict(self.model_config):
+                raise ValueError("Resume model config differs. Legacy linear-head weights cannot resume "
+                                 "conditional-head training; start fresh or explicitly select the legacy model config.")
             if saved["generator_config"] != config_dict(self.generator_config):
                 raise ValueError("Resume generator config differs")
             old = saved["train_config"]
@@ -224,7 +257,7 @@ class MKPTrainer:
             row = dict(M=m, N=n, update=update, transitions=int(rollout["active"].sum()),
                        objective_mean=rollout["objective"].mean().item(),
                        normalized_return=(rollout["objective"] / data[0].sum(-1)).mean().item(),
-                       utilization=rollout["utilization"].item(), **stats,
+                       utilization=rollout["utilization"].item(), **stats, **rollout["diagnostics"],
                        validation_return=validation_return, validation_improvement_pct=improvement,
                        best_validation_return=best, elapsed_seconds=time.perf_counter() - began)
             with (self.run_dir / "metrics.csv").open("a", newline="", encoding="utf-8") as f:
@@ -245,6 +278,8 @@ class MKPTrainer:
                 atomic_checkpoint(c.checkpoint_dir / f"mkp_M{m}_last.pt", payload)
                 if improved:
                     atomic_checkpoint(c.checkpoint_dir / f"mkp_M{m}_best.pt", payload)
+            if update == start or update % c.plot_every == 0 or update == c.updates:
+                self._plot()
         self.logger.info("M=%s complete | best synthetic validation=%.6f", m, best)
 
 

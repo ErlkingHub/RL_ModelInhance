@@ -85,7 +85,7 @@ class Contracts(unittest.TestCase):
         model = MKPModel(self.config).eval()
         # Nonzero heads exercise learned permutation equivariance beyond initial uniform theta.
         with torch.no_grad():
-            model.actor.price_head.weight.normal_(0, 0.1)
+            model.actor.price_head.output.weight.normal_(0, 0.1)
             model.actor.strategy_head.weight.normal_(0, 0.1)
         state = toy_state().state
         items, resources = torch.tensor([2, 0, 3, 1]), torch.tensor([1, 0])
@@ -114,7 +114,7 @@ class Contracts(unittest.TestCase):
         loss = -policy.log_prob(actions)[0] + value.square().mean() + auxiliary.square().mean()
         loss.backward()
         self.assertGreater(model.actor.strategy_head.weight.grad.abs().sum().item(), 0)
-        self.assertGreater(model.actor.price_head.weight.grad.abs().sum().item(), 0)
+        self.assertGreater(model.actor.price_head.output.weight.grad.abs().sum().item(), 0)
         self.assertTrue(all(p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters()))
 
     def test_gae_termination_and_padding(self):

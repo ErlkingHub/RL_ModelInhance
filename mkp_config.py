@@ -10,7 +10,7 @@ DECODER_VERSION = "resource_price_density_v1"
 class TrainConfig:
     num_resources: tuple[int, ...] = (5, 10)
     train_num_items: tuple[int, ...] = (100,)
-    updates: int = 2000
+    updates: int = 800
     batch_size: int = 64
     minibatch_size: int = 128
     ppo_epochs: int = 3
@@ -27,6 +27,9 @@ class TrainConfig:
     validation_every: int = 25
     validation_instances_per_shape: int = 64
     checkpoint_every: int = 100
+    plot_every: int = 100
+    plot_smoothing_window: int = 25
+    plot_dpi: int = 140
     seed: int = 20260910
     validation_seed: int = 1729
     device: str = "auto"
@@ -38,7 +41,8 @@ class TrainConfig:
     def __post_init__(self):
         counts = (self.updates, self.batch_size, self.minibatch_size, self.ppo_epochs,
                   self.validation_every, self.validation_instances_per_shape,
-                  self.checkpoint_every, self.cpu_threads)
+                  self.checkpoint_every, self.cpu_threads, self.plot_every,
+                  self.plot_smoothing_window, self.plot_dpi)
         if any(x < 1 for x in counts):
             raise ValueError("Training counts/intervals must be positive")
         if not self.num_resources or any(x < 1 for x in self.num_resources):
@@ -65,6 +69,8 @@ class ModelConfig:
     ff_multiplier: int = 4
     # No positional embeddings: item/resource order must not encode identity.
     price_floor: float = 0.05
+    price_head_type: str = "conditional"
+    price_head_init_std: float = 0.01
     profit_exponent_min: float = 0.5
     profit_exponent_max: float = 2.0
     scarcity_exponent_max: float = 2.0
@@ -75,6 +81,10 @@ class ModelConfig:
     eps: float = 1e-8
 
     def __post_init__(self):
+        if self.price_head_type not in ("conditional", "linear"):
+            raise ValueError("price_head_type must be conditional or linear")
+        if not 0 < self.price_head_init_std < 1:
+            raise ValueError("price_head_init_std must be in (0, 1)")
         if self.embed_dim < 1 or self.num_heads < 1 or self.embed_dim % self.num_heads:
             raise ValueError("embed_dim must be positive and divisible by num_heads")
         if self.num_layers < 1 or self.ff_multiplier < 1:

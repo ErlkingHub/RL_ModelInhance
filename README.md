@@ -42,6 +42,7 @@
 
 - `runs/<时间戳>/train.log`：每次更新的日志。
 - `runs/<时间戳>/metrics.csv`：收益、归一化 return、利用率、PPO 各项损失、归一化 entropy、KL、梯度范数、Critic explained variance、合成验证表现。
+- `runs/<时间戳>/training_curves_M5.png`、`training_curves_M10.png`：按 M 分开的 4×3 训练诊断图，首次更新、每 100 次更新、各模型结束及退出时刷新；浅色原始曲线，深色为最近 25 条有效观测的均值。
 - `runs/<时间戳>/config.json`：配置与运行环境。
 - `checkpoints/mkp_M5_best.pt`、`mkp_M10_best.pt`：按固定合成验证集的 greedy 归一化收益选择。
 - `checkpoints/mkp_M5_last.pt`、`mkp_M10_last.pt`：最近一次保存的模型，包含优化器和 RNG 状态；默认每 100 次更新、产生新 best 及训练结束时保存。
@@ -147,6 +148,41 @@ pi_i    = softmax(score_i / temperature)，只在可行候选集合中归一化
 - [Schulman 等，2017，Proximal Policy Optimization Algorithms](https://arxiv.org/abs/1707.06347)：使用 clipped PPO 提高策略更新稳定性；这是已有算法，不作为原创贡献。
 
 本实现的待验证设计是：动态资源占用边偏置 + 双向物品/资源竞争表示 + MKP 高层资源策略 + 无参数弱解码器的组合。组合是否具有论文层面的新颖性仍需进一步文献比较；消融对照和真实 gap 结果是论证贡献的必要证据。此实现采用直接 PyTorch 环境与 PPO，便于审查状态/动作/奖励合约，无需依赖 RL4CO 的特定版本接口。
+
+## 条件价格头与训练诊断更新
+
+默认 `ModelConfig.price_head_type="conditional"`，资源价格 logits 改为：
+
+```text
+z_j = v^T tanh(W_r h_j + b_r + W_g g)
+price_j = price_floor + (1 - price_floor) * M * softmax(z)_j
+```
+
+全局状态在 tanh 之前与各资源表示交互，能够改变相对资源价格。最终投影使用标准差 `price_head_init_std=0.01` 的小非零权重，使初始价格接近均匀，同时从第一步就保留上下文梯度。二分图编码器、独立 Critic、其他策略参数、弱解码器 score 以及 PPO 优化目标均保持原设计。
+
+旧 checkpoint 缺失 `price_head_type` 时自动按旧线性价格头加载，不会隐式转换成新结构。新结构需要从头训练；直接用旧权重恢复默认新结构训练会明确报错。显式设置 `price_head_type="linear"` 可用于旧结构对照及兼容续训。已有 checkpoint 文件不会因加载或绘图而被修改。
+
+图表包含训练归一化收益、固定合成验证收益/历史最好值、相对固定弱策略的验证提升、policy/total/value/auxiliary loss、归一化策略熵、KL、clip fraction、实际 PPO 更新比例、提前停止频率、裁剪前梯度范数、Critic explained variance 与 MC RMSE、利用率/选中比例及高层策略统计。
+
+新增 CSV 字段的含义：
+
+- `total_loss`：按现有系数加权后的 PPO 总损失，按实际更新的样本数平均。
+- `entropy_raw` / `rollout_entropy_raw`：原始 categorical entropy，单位 nats；原有 `entropy` 和新增 `rollout_entropy` 都按候选数归一化。前者在 PPO 更新中记录，后者在采集轨迹时记录。
+- `stop_kl`：触发提前停止的那个 minibatch 的 KL；未停止时留空。原有 `approx_kl` 仍只统计已接受的 minibatch。
+- `ppo_update_fraction`：实际完成的 transition 更新次数 / 全部 PPO epochs 计划的 transition 更新次数。
+- `critic_mc_rmse` / `critic_mc_ev`：采集时的 Critic 预测与完整折扣 Monte Carlo return 的误差及 explained variance，不使用价值 bootstrap，排除终止后的 padding。原有 `explained_variance` 继续使用 GAE 目标；两者并列显示，均不反馈进优化。
+- `theta_alpha/beta/kappa/temperature/price_std`：对采集轨迹中所有有效决策等权平均；终止行不参与。
+- `selected_fraction`：episode 结束时的平均选中物品比例。
+
+绘图参数为 `TrainConfig.plot_every`、`plot_smoothing_window`、`plot_dpi`。验证点不做平滑；不同 N 的训练收益分别画线。图中固定验证收益与训练收益来自不同数据集，不直接相减；相对弱策略提升也不等于 Chu 最优性 gap。
+
+可以随时只读取已有日志补画 PNG，不加载 checkpoint，也不执行环境或推理：
+
+```powershell
+& 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' mkp_diagnostics.py --run-dir runs/20260910_154547_742166
+```
+
+旧日志可直接绘图，未记录的新指标显示为缺失，不用零值填补。旧日志生成的图片标为 `linear (legacy)`，代表旧实验。绘图依赖 matplotlib；训练期间绘图失败会写入日志，保留 CSV 和 checkpoint，可在修复绘图环境后离线补画。
 
 ## 交付验证
 

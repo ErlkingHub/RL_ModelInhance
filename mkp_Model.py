@@ -126,17 +126,37 @@ class StrategyTheta:
                              self.scarcity_exponent, self.bottleneck_weight, self.temperature)))
 
 
+class ConditionalPriceHead(nn.Module):
+    """z_j = v^T tanh(W_r h_j + W_g g). Global context changes relative prices."""
+    def __init__(self, config):
+        super().__init__()
+        d = config.embed_dim
+        self.resource = nn.Linear(d, d)
+        self.context = nn.Linear(d, d, bias=False)
+        self.output = nn.Linear(d, 1, bias=False)
+        # Near uniform prices, but a nonzero context gradient from the first update.
+        nn.init.normal_(self.output.weight, std=config.price_head_init_std)
+
+    def forward(self, resources, context):
+        hidden = torch.tanh(self.resource(resources) + self.context(context)[:, None, :])
+        return self.output(hidden).squeeze(-1)
+
+
 class HighLevelController(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
         self.encoder = BipartiteEncoder(config)
-        self.price_head = nn.Linear(2 * config.embed_dim, 1)
+        if config.price_head_type == "conditional":
+            self.price_head = ConditionalPriceHead(config)
+        else:
+            # Exact legacy module/key layout, only for old checkpoints or explicit ablations.
+            self.price_head = nn.Linear(2 * config.embed_dim, 1)
+            nn.init.zeros_(self.price_head.weight)
+            nn.init.zeros_(self.price_head.bias)
         self.strategy_head = nn.Linear(config.embed_dim, 4)
         # Auxiliary state supervision only. Its item outputs never enter decoder scores.
         self.feasibility_head = nn.Linear(config.embed_dim, 1)
-        nn.init.zeros_(self.price_head.weight)
-        nn.init.zeros_(self.price_head.bias)
         nn.init.zeros_(self.strategy_head.weight)
         defaults = (1.0, 1.0, 0.1, 0.2)
         bounds = ((config.profit_exponent_min, config.profit_exponent_max),
@@ -151,7 +171,10 @@ class HighLevelController(nn.Module):
         items, resources, pooled = self.encoder(state)
         c = self.config
         m = resources.shape[1]
-        price_logits = self.price_head(torch.cat((resources, pooled[:, None, :].expand_as(resources)), -1)).squeeze(-1)
+        if c.price_head_type == "conditional":
+            price_logits = self.price_head(resources, pooled)
+        else:
+            price_logits = self.price_head(torch.cat((resources, pooled[:, None, :].expand_as(resources)), -1)).squeeze(-1)
         prices = c.price_floor + (1 - c.price_floor) * m * price_logits.softmax(-1)
         controls = self.strategy_head(pooled).sigmoid()
         theta = StrategyTheta(
