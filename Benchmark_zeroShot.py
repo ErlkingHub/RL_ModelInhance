@@ -8,7 +8,7 @@ from pathlib import Path
 import time
 import numpy as np
 import torch
-from mkp_config import BenchmarkConfig, config_dict
+from mkp_config import BenchmarkConfig, ModelConfig, config_dict, variant_name
 from mkp_data import instance_batch, load_benchmark
 from mkp_utils import (construct_solution, file_sha256, load_checkpoint, resolve_device,
                        seed_everything, write_json)
@@ -51,11 +51,11 @@ def take_result(result, index):
 
 @torch.no_grad()
 def solve_instance(instance, model, method, config, device):
-    budget = config.sample_rollouts if method == "learned_dynamic_sampled" else 1
+    budget = config.sample_rollouts if method.endswith("_sampled") else 1
     if budget < 1:
         raise ValueError("Sample budget must be positive")
-    sampled = method == "learned_dynamic_sampled"
-    mode = "learned_dynamic" if sampled else method
+    sampled = method.endswith("_sampled")
+    mode = "learned_dynamic"
     objectives, best, best_value = [], None, -float("inf")
     synchronize(device)
     began = time.perf_counter()
@@ -87,12 +87,25 @@ def summarize(rows):
             worst_gap_pct=float(np.max(gaps)) if gaps else None,
             target_hit_rate=float(np.mean([r["target_hit"] for r in group if r["gap_pct"] is not None])) if gaps else None,
             feasible_rate=mean("feasible"), mean_objective=mean("objective"),
-            mean_seconds=mean("solve_seconds"), total_seconds=float(sum(r["solve_seconds"] for r in group)),
-            mean_improvement_over_fixed_pct=mean("improvement_over_fixed_pct"),
-            mean_improvement_over_static_pct=mean("improvement_over_static_pct"),
-            wins_over_fixed=sum(r["improvement_over_fixed_pct"] > 1e-9 for r in group),
-            wins_over_static=sum(r["improvement_over_static_pct"] > 1e-9 for r in group)))
+            mean_seconds=mean("solve_seconds"), total_seconds=float(sum(r["solve_seconds"] for r in group))))
     return summaries
+
+
+def compare_heads(rows):
+    """Paired greedy results; sampled best-of-K rows never enter this comparison."""
+    lookup = {(r["instance_id"], r["M"], r["N"], r["method"]): r for r in rows}
+    paired = []
+    for weak in rows:
+        if weak["method"] != "learned_dynamic":
+            continue
+        direct = lookup[(weak["instance_id"], weak["M"], weak["N"], "direct_item_masked")]
+        paired.append(dict(instance_id=weak["instance_id"], M=weak["M"], N=weak["N"],
+            weak_gap_pct=weak["gap_pct"], direct_gap_pct=direct["gap_pct"],
+            direct_minus_weak_gap_pp=(direct["gap_pct"] - weak["gap_pct"])
+            if weak["gap_pct"] is not None and direct["gap_pct"] is not None else None,
+            direct_profit_improvement_pct=100 * (direct["objective"] - weak["objective"]) / max(weak["objective"], 1e-8),
+            weak_seconds=weak["solve_seconds"], direct_seconds=direct["solve_seconds"]))
+    return paired
 
 
 def write_csv(path, rows):
@@ -110,17 +123,22 @@ def benchmark(config=None):
     seed_everything(c.seed, deterministic=True, cpu_threads=c.cpu_threads)
     instances = load_benchmark(c.dataset, c.num_resources, c.num_items)
     models, metadata = {}, {}
+    heads = ("weak", "direct_item") if c.compare_heads else (c.policy_head,)
     # Fail before starting inference if any required checkpoint is missing/incompatible.
-    for m in sorted({inst.m for inst in instances}):
-        checkpoint = c.checkpoint_dir / f"mkp_M{m}_{c.checkpoint_tag}.pt"
-        if not checkpoint.is_file():
-            raise FileNotFoundError(f"Missing {checkpoint}; run train_ConstrainedMKP.py first")
-        models[m], payload = load_checkpoint(checkpoint, device, m)
-        models[m].eval().requires_grad_(False)
-        metadata[str(m)] = {"path": str(checkpoint.resolve()), "sha256": file_sha256(checkpoint),
-                            "update": payload["update"], "model_config": payload["model_config"],
-                            "train_num_items": payload["train_config"]["train_num_items"],
-                            "training_data_source": payload["training_data_source"]}
+    for head in heads:
+        architecture = ModelConfig(encoder_type=c.encoder_type, policy_head=head)
+        for m in sorted({inst.m for inst in instances}):
+            checkpoint = c.checkpoint_dir / variant_name(architecture) / f"mkp_M{m}_{c.checkpoint_tag}.pt"
+            if not checkpoint.is_file():
+                raise FileNotFoundError(f"Missing {checkpoint}; train the matching encoder and policy head first")
+            model, payload = load_checkpoint(checkpoint, device, m)
+            if model.config.encoder_type != c.encoder_type or model.config.policy_head != head:
+                raise ValueError(f"Checkpoint architecture does not match requested encoder/head: {checkpoint}")
+            models[head, m] = model.eval().requires_grad_(False)
+            metadata[f"{head}:M{m}"] = {"path": str(checkpoint.resolve()), "sha256": file_sha256(checkpoint),
+                "update": payload["update"], "model_config": config_dict(model.config),
+                "train_num_items": payload["train_config"]["train_num_items"],
+                "training_data_source": payload["training_data_source"], "train_config": payload["train_config"]}
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     output = c.results_dir / stamp
     output.mkdir(parents=True, exist_ok=False)
@@ -132,14 +150,17 @@ def benchmark(config=None):
                 "timing": "Full construction including transfer, synchronized CUDA, no warmup; excludes checkpoint loading",
                 "instance_count": len(instances), "status": "running"}
     write_json(output / "manifest.json", manifest)
-    methods = ["fixed", "learned_static", "learned_dynamic"]
-    if c.sample_rollouts:
-        methods.append("learned_dynamic_sampled")
-    fields = ["instance_id", "M", "N", "method", "rollouts", "objective", "reference", "reference_type",
+    methods = []
+    for head in heads:
+        label = "learned_dynamic" if head == "weak" else "direct_item_masked"
+        methods.append((head, label))
+        if c.sample_rollouts:
+            methods.append((head, label + "_sampled"))
+    fields = ["instance_id", "M", "N", "method", "encoder_type", "policy_head", "rollouts", "objective", "reference", "reference_type",
               "gap_pct", "target_hit", "reference_exceeded", "feasible", "max_capacity_violation",
               "selected_count", "mean_utilization", "min_utilization", "max_utilization", "utilization_by_resource",
               "solve_seconds", "seconds_per_rollout", "sample_mean_objective", "sample_std_objective",
-              "improvement_over_fixed_pct", "improvement_over_static_pct", "profit_exponent_mean",
+              "profit_exponent_mean",
               "scarcity_exponent_mean", "bottleneck_weight_mean", "temperature_mean", "price_std_mean",
               "size_zero_shot", "checkpoint_sha256", "solution_file"]
     rows = []
@@ -149,8 +170,9 @@ def benchmark(config=None):
         writer.writeheader()
         try:
             for number, instance in enumerate(instances, start=1):
-                instance_rows, objectives = [], {}
-                for method in methods:
+                instance_rows = []
+                for head, method in methods:
+                    meta = metadata[f"{head}:M{instance.m}"]
                     # Each instance's sample stream is independent of filtering and prior instances.
                     if method.endswith("sampled"):
                         import hashlib
@@ -158,12 +180,12 @@ def benchmark(config=None):
                         torch.manual_seed(c.seed + salt)
                         if device.type == "cuda":
                             torch.cuda.manual_seed_all(c.seed + salt)
-                    result, elapsed, samples = solve_instance(instance, models[instance.m], method, c, device)
+                    result, elapsed, samples = solve_instance(instance, models[head, instance.m], method, c, device)
                     objective, utilization, violation, sequence = verify_solution(instance, result, c.feasibility_tolerance)
-                    objectives[method] = objective
                     gap = 100 * (instance.reference - objective) / instance.reference if instance.reference is not None else None
-                    stats = result["theta_mean"].tolist()
+                    stats = [v if math.isfinite(v) else None for v in result["theta_mean"].tolist()]
                     row = dict(instance_id=instance.instance_id, M=instance.m, N=instance.n, method=method,
+                        encoder_type=c.encoder_type, policy_head=head,
                         rollouts=len(samples), objective=objective, reference=instance.reference,
                         reference_type="dataset_best_known", gap_pct=gap,
                         target_hit=int(gap <= c.target_gap_pct) if gap is not None else None,
@@ -175,21 +197,17 @@ def benchmark(config=None):
                         sample_mean_objective=float(np.mean(samples)), sample_std_objective=float(np.std(samples)),
                         profit_exponent_mean=stats[0], scarcity_exponent_mean=stats[1],
                         bottleneck_weight_mean=stats[2], temperature_mean=stats[3], price_std_mean=stats[4],
-                        size_zero_shot=int(instance.n not in metadata[str(instance.m)]["train_num_items"]),
-                        checkpoint_sha256=metadata[str(instance.m)]["sha256"], solution_file="solutions.jsonl")
+                        size_zero_shot=int(instance.n not in meta["train_num_items"]),
+                        checkpoint_sha256=meta["sha256"], solution_file="solutions.jsonl")
                     instance_rows.append(row)
                     solution_stream.write(json.dumps({"instance_id": instance.instance_id, "method": method,
                                                       "item_indices_zero_based": sequence, "objective": objective}) + "\n")
                 for row in instance_rows:
-                    for baseline in ("fixed", "static"):
-                        key = "fixed" if baseline == "fixed" else "learned_static"
-                        reference = objectives[key]
-                        row[f"improvement_over_{baseline}_pct"] = 100 * (row["objective"] - reference) / max(reference, 1e-8)
                     writer.writerow(row)
                     rows.append(row)
                 stream.flush()
                 solution_stream.flush()
-                primary = next(r for r in instance_rows if r["method"] == "learned_dynamic")
+                primary = instance_rows[0]
                 gap_text = f"{primary['gap_pct']:.4f}%" if primary["gap_pct"] is not None else "NA"
                 print(f"[{number}/{len(instances)}] id={instance.instance_id} M={instance.m} N={instance.n} gap={gap_text}")
         except Exception as exc:
@@ -197,6 +215,8 @@ def benchmark(config=None):
             write_json(output / "manifest.json", manifest)
             raise
     write_csv(output / "summary.csv", summarize(rows))
+    if c.compare_heads:
+        write_csv(output / "head_comparison.csv", compare_heads(rows))
     manifest.update(status="complete", completed_rows=len(rows))
     write_json(output / "manifest.json", manifest)
     print(f"Results: {output}")
@@ -215,11 +235,15 @@ def main(argv=None):
     parser.add_argument("--seed", type=int, default=defaults.seed)
     parser.add_argument("--sample-rollouts", type=int, default=defaults.sample_rollouts)
     parser.add_argument("--sample-batch-size", type=int, default=defaults.sample_batch_size)
+    parser.add_argument("--encoder", choices=("bgnn", "transformer"), default=defaults.encoder_type)
+    parser.add_argument("--policy-head", choices=("weak", "direct_item"), default=defaults.policy_head)
+    parser.add_argument("--compare-heads", action="store_true", help="Compare independently trained weak and direct-item heads")
     args = parser.parse_args(argv)
     benchmark(BenchmarkConfig(dataset=args.dataset, num_resources=tuple(args.resources),
                               num_items=tuple(args.items), checkpoint_dir=args.checkpoint_dir,
                               checkpoint_tag=args.checkpoint_tag, device=args.device, seed=args.seed,
-                              sample_rollouts=args.sample_rollouts, sample_batch_size=args.sample_batch_size))
+                              sample_rollouts=args.sample_rollouts, sample_batch_size=args.sample_batch_size,
+                              encoder_type=args.encoder, policy_head=args.policy_head, compare_heads=args.compare_heads))
 
 
 if __name__ == "__main__":

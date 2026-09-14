@@ -112,9 +112,14 @@ def create_training_diagnostics(run_dir, smoothing_window=25, dpi=140):
         curve(axes[1], "validation_return", "Greedy validation", colors[0], False)
         curve(axes[1], "best_validation_return", "Best so far", colors[3], False)
         axes[1].set_ylabel("Normalized return (independent fixed set)")
-        curve(axes[2], "validation_improvement_pct", "Relative objective improvement", colors[0], False)
-        axes[2].axhline(0, color="gray", linestyle="--", linewidth=0.8)
-        axes[2].set_ylabel("Improvement (%) - not optimality gap")
+        if any(math.isfinite(r.get("validation_objective_mean", float("nan"))) for r in selected):
+            axes[2].set_title("Dynamic-policy validation objective", loc="left", fontsize=11, fontweight="bold")
+            curve(axes[2], "validation_objective_mean", "Mean objective (fixed validation mix)", colors[0], False)
+            axes[2].set_ylabel("Raw profit - not optimality gap")
+        else:
+            curve(axes[2], "validation_improvement_pct", "Relative objective improvement", colors[0], False)
+            axes[2].axhline(0, color="gray", linestyle="--", linewidth=0.8)
+            axes[2].set_ylabel("Improvement (%) - not optimality gap")
         curve(axes[3], "policy_loss", "Policy loss", colors[0])
         curve(axes[3], "total_loss", "Weighted total loss", colors[1])
         curve(axes[4], "value_loss", "Value loss", colors[0])
@@ -158,10 +163,15 @@ def create_training_diagnostics(run_dir, smoothing_window=25, dpi=140):
             if handles:
                 ax.legend(handles, labels, fontsize=7, loc="best", framealpha=0.85)
             if not ax.has_data():
-                ax.text(0.5, 0.5, "Not recorded in this CSV", transform=ax.transAxes,
+                label = ("Not applicable: direct item head" if ax is axes[11] and
+                         settings.get("model", {}).get("policy_head") == "direct_item" else "Not recorded in this CSV")
+                ax.text(0.5, 0.5, label, transform=ax.transAxes,
                         ha="center", va="center", color="gray", fontsize=10)
-        model_type = settings.get("model", {}).get("price_head_type", "linear (legacy)")
-        figure.suptitle(f"MKP training diagnostics | M={m} | price head: {model_type}\n"
+        model_settings = settings.get("model", {})
+        model_type = (f"{model_settings.get('encoder_type', 'transformer')} / "
+                      f"{model_settings.get('policy_head', 'weak')} / "
+                      f"{model_settings.get('price_head_type', 'linear (legacy)')}")
+        figure.suptitle(f"MKP training diagnostics | M={m} | model: {model_type}\n"
                         f"{run_dir.name} | {len(selected)} updates | trailing mean: {smoothing_window} observations\n"
                         "Faint lines: raw data. Missing legacy metrics are omitted. Synthetic validation is not Chu gap.",
                         fontsize=13)

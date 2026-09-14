@@ -6,9 +6,9 @@ from pathlib import Path
 import random
 import numpy as np
 import torch
-from mkp_config import CHECKPOINT_VERSION, DECODER_VERSION, ModelConfig
+from mkp_config import CHECKPOINT_VERSION, ModelConfig, decoder_version
 from mkp_env import MKPEnv
-from mkp_Model import MKPModel, WeakDecoder
+from mkp_Model import MKPModel, WeakDecoder, strategy_statistics
 
 
 def resolve_device(name):
@@ -58,8 +58,6 @@ def load_checkpoint(path, device, expected_m=None):
     payload = torch.load(path, map_location="cpu", weights_only=True)
     if payload.get("checkpoint_version") != CHECKPOINT_VERSION:
         raise ValueError("Incompatible checkpoint schema")
-    if payload.get("decoder_version") != DECODER_VERSION:
-        raise ValueError("Checkpoint's weak decoder differs from this implementation")
     if expected_m is not None and payload["num_resources"] != expected_m:
         raise ValueError(f"Checkpoint M={payload['num_resources']} differs from requested M={expected_m}")
     if payload.get("training_data_source") != "synthetic_only":
@@ -67,7 +65,12 @@ def load_checkpoint(path, device, expected_m=None):
     model_settings = dict(payload["model_config"])
     if "price_head_type" not in model_settings:
         model_settings["price_head_type"] = "linear"
-    model = MKPModel(ModelConfig(**model_settings))
+    model_settings.setdefault("encoder_type", "transformer")
+    model_settings.setdefault("policy_head", "weak")
+    config = ModelConfig(**model_settings)
+    if payload.get("decoder_version") != decoder_version(config):
+        raise ValueError("Checkpoint decoder does not match its policy-head configuration")
+    model = MKPModel(config)
     model.load_state_dict(payload["model_state"], strict=True)
     return model.to(device), payload
 
@@ -79,6 +82,8 @@ def construct_solution(data, model=None, mode="learned_dynamic", stochastic=Fals
         raise ValueError(mode)
     if mode != "fixed" and model is None:
         raise ValueError("A model is required for learned inference")
+    if model is not None and model.config.policy_head == "direct_item" and mode != "learned_dynamic":
+        raise ValueError("Direct item policy only supports dynamic autoregressive inference")
     env = MKPEnv(*data)
     decoder = model.decoder if model is not None else WeakDecoder(model_config or ModelConfig())
     if model is not None:
@@ -94,12 +99,11 @@ def construct_solution(data, model=None, mode="learned_dynamic", stochastic=Fals
         if not active.any():
             break
         if mode == "learned_dynamic":
-            theta = model.actor(env.state)[0]
-        policy = decoder(env.state, theta)
+            policy, theta, _ = model.policy(env.state)
+        else:
+            policy = decoder(env.state, theta)
         actions = policy.choose(stochastic)
-        stats = torch.stack((theta.profit_exponent, theta.scarcity_exponent,
-                             theta.bottleneck_weight, theta.temperature,
-                             theta.resource_prices.std(-1, unbiased=False)), dim=-1)
+        stats = strategy_statistics(theta, data[0].shape[0], data[0].device)
         theta_sum += stats * active[:, None]
         theta_count += active
         sequences.append(actions)

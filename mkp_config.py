@@ -63,6 +63,9 @@ class TrainConfig:
 
 @dataclass
 class ModelConfig:
+    encoder_type: str = "bgnn"
+    policy_head: str = "weak"
+    direct_logit_clip: float = 10.0
     embed_dim: int = 128
     num_heads: int = 8
     num_layers: int = 2
@@ -81,11 +84,15 @@ class ModelConfig:
     eps: float = 1e-8
 
     def __post_init__(self):
+        if self.encoder_type not in ("bgnn", "transformer"):
+            raise ValueError("encoder_type must be bgnn or transformer")
+        if self.policy_head not in ("weak", "direct_item") or self.direct_logit_clip <= 0:
+            raise ValueError("Invalid policy_head or direct_logit_clip")
         if self.price_head_type not in ("conditional", "linear"):
             raise ValueError("price_head_type must be conditional or linear")
         if not 0 < self.price_head_init_std < 1:
             raise ValueError("price_head_init_std must be in (0, 1)")
-        if self.embed_dim < 1 or self.num_heads < 1 or self.embed_dim % self.num_heads:
+        if self.embed_dim < 1 or self.num_heads < 1 or (self.encoder_type == "transformer" and self.embed_dim % self.num_heads):
             raise ValueError("embed_dim must be positive and divisible by num_heads")
         if self.num_layers < 1 or self.ff_multiplier < 1:
             raise ValueError("num_layers and ff_multiplier must be positive")
@@ -122,6 +129,9 @@ class GeneratorConfig:
 
 @dataclass
 class BenchmarkConfig:
+    encoder_type: str = "bgnn"
+    policy_head: str = "weak"
+    compare_heads: bool = False
     dataset: Path = field(default_factory=lambda: ROOT / "MKP_dataset" / "Benchmarks_Chu.mat")
     num_resources: tuple[int, ...] = (5, 10)
     num_items: tuple[int, ...] = (100, 250, 500)
@@ -138,6 +148,8 @@ class BenchmarkConfig:
     cpu_threads: int = 4
 
     def __post_init__(self):
+        if self.encoder_type not in ("bgnn", "transformer") or self.policy_head not in ("weak", "direct_item"):
+            raise ValueError("Invalid encoder_type or policy_head")
         if self.sample_rollouts < 0 or self.sample_batch_size < 1 or self.cpu_threads < 1:
             raise ValueError("Invalid benchmark budget")
         if self.target_gap_pct < 0 or self.feasibility_tolerance < 0:
@@ -152,3 +164,11 @@ class BenchmarkConfig:
 
 def config_dict(config):
     return {k: str(v) if isinstance(v, Path) else v for k, v in asdict(config).items()}
+
+
+def variant_name(config):
+    return f"{config.encoder_type}_{config.policy_head}"
+
+
+def decoder_version(config):
+    return DECODER_VERSION if config.policy_head == "weak" else "direct_item_masked_v1"

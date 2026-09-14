@@ -1,4 +1,8 @@
-# Transformer 高层策略控制的强化学习 MKP
+# BGNN 高层策略控制的强化学习 MKP
+
+**当前 BGNN 分支的运行说明见 [BGNN.md](BGNN.md)。** 默认已改为 Item–Constraint BGNN + 动态弱评分 + PPO，并提供独立的直接 item logits + mask 对照。训练/评测入口不再运行 fixed 或 learned_static。新模型按 `bgnn_weak`、`bgnn_direct_item` 分目录保存。
+
+下文保留原 Transformer 版本的设计背景；当前默认参数、运行目录、checkpoint 兼容约定和对照命令均以 BGNN.md 为准。
 
 实现路径：**动态 MKP 状态 → 二分图 Transformer → 高层策略 θ → 固定弱解码器 → 可行物品 → 状态更新**。
 

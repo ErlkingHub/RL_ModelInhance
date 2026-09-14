@@ -1,8 +1,8 @@
-"""Bipartite Transformer -> low-dimensional theta -> parameter-free weak decoder.
+"""BGNN -> low-dimensional theta -> parameter-free weak decoder (default).
 
 Ideas: variable/constraint graph (Gasse et al., 2019); attention for constructive
 optimization (Kool et al., 2019). This is an MKP-specific implementation, not a
-reproduction of either paper. The actor never produces learned per-item logits.
+reproduction of either paper. An optional direct-item masked actor is a separate comparison.
 """
 from dataclasses import dataclass
 import math
@@ -10,6 +10,11 @@ import torch
 from torch import nn
 from mkp_config import ModelConfig
 from mkp_env import MKPState
+from mkp_bgnn import BGNNEncoder
+
+
+def make_encoder(config):
+    return BGNNEncoder(config) if config.encoder_type == "bgnn" else BipartiteEncoder(config)
 
 
 def state_features(state: MKPState, config: ModelConfig):
@@ -146,7 +151,7 @@ class HighLevelController(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
-        self.encoder = BipartiteEncoder(config)
+        self.encoder = make_encoder(config)
         if config.price_head_type == "conditional":
             self.price_head = ConditionalPriceHead(config)
         else:
@@ -229,6 +234,55 @@ class CandidatePolicy:
         return self.entropy() / count.clamp_min(2).log()
 
 
+class MaskedItemPolicy:
+    """Dense categorical mask, with a dummy distribution only for terminal rows."""
+    def __init__(self, logits, feasible):
+        self.active = feasible.any(-1)
+        self.feasible = feasible
+        masked = logits.masked_fill(~feasible, -torch.inf)
+        # Avoid all -inf softmax; terminal rows always return -1 and zero log-prob/entropy.
+        safe = torch.where(self.active[:, None], masked, torch.zeros_like(masked))
+        self.distribution = torch.distributions.Categorical(logits=safe)
+
+    def choose(self, stochastic=False):
+        action = self.distribution.sample() if stochastic else self.distribution.logits.argmax(-1)
+        return torch.where(self.active, action, -1)
+
+    def log_prob(self, actions):
+        result = self.distribution.log_prob(actions.clamp_min(0))
+        return torch.where(self.active, result, 0.0)
+
+    def entropy(self):
+        return torch.where(self.active, self.distribution.entropy(), 0.0)
+
+    def normalized_entropy(self):
+        return self.entropy() / self.feasible.sum(-1).clamp_min(2).float().log()
+
+
+class DirectItemController(nn.Module):
+    """Optional comparison: learned item logits, not the parameter-free weak decoder."""
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.encoder = make_encoder(config)
+        d = config.embed_dim
+        self.item_head = nn.Sequential(nn.Linear(2 * d, d), nn.Tanh(), nn.Linear(d, 1))
+        self.feasibility_head = nn.Linear(d, 1)
+
+    def forward(self, state):
+        items, _, pooled = self.encoder(state)
+        raw = self.item_head(torch.cat((items, pooled[:, None, :].expand_as(items)), -1)).squeeze(-1)
+        logits = self.config.direct_logit_clip * torch.tanh(raw)
+        return logits, self.feasibility_head(items).squeeze(-1)
+
+
+def strategy_statistics(theta, batch_size, device):
+    if theta is None:
+        return torch.full((batch_size, 5), float("nan"), device=device)
+    return torch.stack((theta.profit_exponent, theta.scarcity_exponent, theta.bottleneck_weight,
+                        theta.temperature, theta.resource_prices.std(-1, unbiased=False)), -1)
+
+
 class WeakDecoder:
     """No nn.Module, trainable weight, pointer, search, local repair or solver.
 
@@ -278,13 +332,18 @@ class MKPModel(nn.Module):
     def __init__(self, config: ModelConfig | None = None):
         super().__init__()
         self.config = config or ModelConfig()
-        self.actor = HighLevelController(self.config)
         # Independent critic: actor changes cannot silently change the baseline representation.
-        self.critic_encoder = BipartiteEncoder(self.config)
+        self.critic_encoder = make_encoder(self.config)
         self.value_head = nn.Linear(self.config.embed_dim, 1)
+        # Construct the common critic first so paired head experiments share its initialization.
+        self.actor = (HighLevelController(self.config) if self.config.policy_head == "weak"
+                      else DirectItemController(self.config))
         self.decoder = WeakDecoder(self.config)
 
     def policy(self, state):
+        if self.config.policy_head == "direct_item":
+            logits, feasibility_logits = self.actor(state)
+            return MaskedItemPolicy(logits, state.feasible), None, feasibility_logits
         theta, feasibility_logits = self.actor(state)
         return self.decoder(state, theta), theta, feasibility_logits
 

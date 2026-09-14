@@ -11,11 +11,11 @@ import time
 import numpy as np
 import torch
 from torch.nn import functional as F
-from mkp_config import (CHECKPOINT_VERSION, DECODER_VERSION, ModelConfig, GeneratorConfig,
-                        TrainConfig, config_dict)
+from mkp_config import (CHECKPOINT_VERSION, ModelConfig, GeneratorConfig,
+                        TrainConfig, config_dict, variant_name, decoder_version)
 from mkp_data import synthetic_batch
 from mkp_env import MKPEnv, MKPState
-from mkp_Model import MKPModel
+from mkp_Model import MKPModel, strategy_statistics
 from mkp_diagnostics import create_training_diagnostics, critic_diagnostics
 from mkp_utils import (atomic_checkpoint, construct_solution, load_checkpoint, resolve_device,
                        seed_everything, write_json)
@@ -48,9 +48,8 @@ def collect_rollout(model, data):
         if not active.any():
             break
         policy, value, theta, _ = model(env.state)
-        diagnostics = torch.stack((policy.entropy(), policy.normalized_entropy(),
-            theta.profit_exponent, theta.scarcity_exponent, theta.bottleneck_weight,
-            theta.temperature, theta.resource_prices.std(-1, unbiased=False)), dim=-1)
+        diagnostics = torch.cat((policy.entropy()[:, None], policy.normalized_entropy()[:, None],
+            strategy_statistics(theta, data[0].shape[0], data[0].device)), dim=-1)
         diagnostic_sum += (diagnostics * active[:, None]).sum(0)
         diagnostic_count += active.sum()
         actions = policy.choose(stochastic=True)
@@ -85,9 +84,10 @@ class MKPTrainer:
         self.generator_config = generator or GeneratorConfig()
         self.device = resolve_device(self.config.device)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        self.run_dir = self.config.runs_dir / stamp
+        self.run_dir = self.config.runs_dir / variant_name(self.model_config) / stamp
         self.run_dir.mkdir(parents=True, exist_ok=False)
-        self.config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.checkpoint_dir = self.config.checkpoint_dir / variant_name(self.model_config)
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.logger = logging.getLogger(f"mkp.{stamp}")
         self.logger.setLevel(logging.INFO)
         self.logger.propagate = False
@@ -98,7 +98,7 @@ class MKPTrainer:
         self.fields = ["M", "N", "update", "transitions", "objective_mean", "normalized_return",
                        "utilization", "policy_loss", "value_loss", "constraint_aux_loss",
                        "entropy", "approx_kl", "clip_fraction", "grad_norm", "explained_variance",
-                       "minibatches", "kl_stopped", "validation_return", "validation_improvement_pct",
+                       "minibatches", "kl_stopped", "validation_return", "validation_objective_mean",
                        "best_validation_return", "elapsed_seconds"]
         self.fields += ["total_loss", "entropy_raw", "rollout_entropy", "rollout_entropy_raw",
                         "stop_kl", "ppo_update_fraction", "critic_mc_rmse", "critic_mc_ev",
@@ -209,8 +209,8 @@ class MKPTrainer:
         if resume:
             model, saved = load_checkpoint(resume, self.device, m)
             if config_dict(model.config) != config_dict(self.model_config):
-                raise ValueError("Resume model config differs. Legacy linear-head weights cannot resume "
-                                 "conditional-head training; start fresh or explicitly select the legacy model config.")
+                raise ValueError("Resume model config differs (encoder/head included); start a fresh "
+                                 "BGNN experiment or select the original architecture explicitly.")
             if saved["generator_config"] != config_dict(self.generator_config):
                 raise ValueError("Resume generator config differs")
             old = saved["train_config"]
@@ -228,8 +228,6 @@ class MKPTrainer:
         vrng = np.random.default_rng(c.validation_seed + m)
         validation = [synthetic_batch(c.validation_instances_per_shape, n, m, self.generator_config,
                                      vrng, self.device) for n in c.train_num_items]
-        fixed_objectives = [construct_solution(data, mode="fixed", model_config=self.model_config)["objective"]
-                            for data in validation]
         if saved:
             rng.bit_generator.state = saved["numpy_generator_state"]
             torch.set_rng_state(saved["torch_rng_state"])
@@ -245,20 +243,19 @@ class MKPTrainer:
             data = synthetic_batch(c.batch_size, n, m, self.generator_config, rng, self.device)
             rollout = collect_rollout(model, data)
             stats = self.ppo_update(model, optimizer, data, rollout)
-            validation_return, improvement = None, None
+            validation_return, validation_objective = None, None
             improved = False
             if update == start or update % c.validation_every == 0 or update == c.updates:
                 objectives = [construct_solution(d, model)["objective"] for d in validation]
                 validation_return = torch.cat([obj / d[0].sum(-1) for obj, d in zip(objectives, validation)]).mean().item()
-                improvement = torch.cat([100 * (obj - ref) / ref.clamp_min(1)
-                                         for obj, ref in zip(objectives, fixed_objectives)]).mean().item()
+                validation_objective = torch.cat(objectives).mean().item()
                 improved = validation_return > best
                 best = max(best, validation_return)
             row = dict(M=m, N=n, update=update, transitions=int(rollout["active"].sum()),
                        objective_mean=rollout["objective"].mean().item(),
                        normalized_return=(rollout["objective"] / data[0].sum(-1)).mean().item(),
                        utilization=rollout["utilization"].item(), **stats, **rollout["diagnostics"],
-                       validation_return=validation_return, validation_improvement_pct=improvement,
+                       validation_return=validation_return, validation_objective_mean=validation_objective,
                        best_validation_return=best, elapsed_seconds=time.perf_counter() - began)
             with (self.run_dir / "metrics.csv").open("a", newline="", encoding="utf-8") as f:
                 csv.DictWriter(f, fieldnames=self.fields).writerow(row)
@@ -266,7 +263,7 @@ class MKPTrainer:
                              m, update, c.updates, n, row["normalized_return"], stats["policy_loss"],
                              stats["value_loss"], stats["approx_kl"], validation_return)
             if improved or update % c.checkpoint_every == 0 or update == c.updates:
-                payload = {"checkpoint_version": CHECKPOINT_VERSION, "decoder_version": DECODER_VERSION,
+                payload = {"checkpoint_version": CHECKPOINT_VERSION, "decoder_version": decoder_version(self.model_config),
                            "model_config": config_dict(self.model_config), "train_config": config_dict(c),
                            "generator_config": config_dict(self.generator_config), "num_resources": m,
                            "training_data_source": "synthetic_only", "update": update,
@@ -275,9 +272,9 @@ class MKPTrainer:
                            "torch_rng_state": torch.get_rng_state(),
                            "cuda_rng_state": torch.cuda.get_rng_state_all() if self.device.type == "cuda" else [],
                            "run_dir": str(self.run_dir), "torch_version": str(torch.__version__)}
-                atomic_checkpoint(c.checkpoint_dir / f"mkp_M{m}_last.pt", payload)
+                atomic_checkpoint(self.checkpoint_dir / f"mkp_M{m}_last.pt", payload)
                 if improved:
-                    atomic_checkpoint(c.checkpoint_dir / f"mkp_M{m}_best.pt", payload)
+                    atomic_checkpoint(self.checkpoint_dir / f"mkp_M{m}_best.pt", payload)
             if update == start or update % c.plot_every == 0 or update == c.updates:
                 self._plot()
         self.logger.info("M=%s complete | best synthetic validation=%.6f", m, best)
@@ -294,8 +291,14 @@ def main(argv=None):
     parser.add_argument("--device", default=defaults.device)
     parser.add_argument("--seed", type=int, default=defaults.seed)
     parser.add_argument("--resume", default=None)
+    parser.add_argument("--encoder", choices=("bgnn", "transformer"), default=ModelConfig().encoder_type)
+    parser.add_argument("--policy-head", choices=("weak", "direct_item"), default=ModelConfig().policy_head)
+    parser.add_argument("--compare-heads", action="store_true", help="Train both heads independently with matched settings")
     args = parser.parse_args(argv)
     config = TrainConfig(num_resources=tuple(args.resources), train_num_items=tuple(args.train_items),
                          updates=args.updates, batch_size=args.batch_size, minibatch_size=args.minibatch_size,
                          device=args.device, seed=args.seed)
-    MKPTrainer(config).train(args.resume)
+    if args.resume and args.compare_heads:
+        parser.error("--resume cannot be combined with --compare-heads")
+    for head in (("weak", "direct_item") if args.compare_heads else (args.policy_head,)):
+        MKPTrainer(config, ModelConfig(encoder_type=args.encoder, policy_head=head)).train(args.resume)

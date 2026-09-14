@@ -32,11 +32,14 @@ class PriceAndDiagnostics(unittest.TestCase):
         self.assertTrue(torch.allclose(head(resources[:, order], context), logits[:, order]))
 
     def test_legacy_checkpoint_retains_linear_architecture(self):
-        config = ModelConfig(embed_dim=16, num_heads=4, num_layers=1, price_head_type="linear")
+        config = ModelConfig(embed_dim=16, num_heads=4, num_layers=1, price_head_type="linear", encoder_type="transformer")
         model = MKPModel(config)
         settings = config_dict(config)
         del settings["price_head_type"]
         del settings["price_head_init_std"]
+        del settings["encoder_type"]
+        del settings["policy_head"]
+        del settings["direct_logit_clip"]
         payload = dict(checkpoint_version=CHECKPOINT_VERSION, decoder_version=DECODER_VERSION,
                        training_data_source="synthetic_only", num_resources=2,
                        model_config=settings, model_state=model.state_dict())
