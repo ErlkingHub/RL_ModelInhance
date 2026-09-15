@@ -140,7 +140,7 @@ def benchmark(config=None):
               "selected_count", "mean_utilization", "min_utilization", "max_utilization", "utilization_by_resource",
               "solve_seconds", "seconds_per_rollout", "sample_mean_objective", "sample_std_objective",
               "improvement_over_fixed_pct", "improvement_over_static_pct", "profit_exponent_mean",
-              "scarcity_exponent_mean", "bottleneck_weight_mean", "temperature_mean", "price_std_mean",
+              "bottleneck_weight_mean", "effective_weight_std_mean",
               "size_zero_shot", "checkpoint_sha256", "solution_file"]
     rows = []
     with (output / "instances.csv").open("w", newline="", encoding="utf-8-sig") as stream, \
@@ -173,8 +173,8 @@ def benchmark(config=None):
                         max_utilization=float(utilization.max()), utilization_by_resource=json.dumps(utilization.tolist()),
                         solve_seconds=elapsed, seconds_per_rollout=elapsed / len(samples),
                         sample_mean_objective=float(np.mean(samples)), sample_std_objective=float(np.std(samples)),
-                        profit_exponent_mean=stats[0], scarcity_exponent_mean=stats[1],
-                        bottleneck_weight_mean=stats[2], temperature_mean=stats[3], price_std_mean=stats[4],
+                        profit_exponent_mean=stats[0], bottleneck_weight_mean=stats[1],
+                        effective_weight_std_mean=stats[2],
                         size_zero_shot=int(instance.n not in metadata[str(instance.m)]["train_num_items"]),
                         checkpoint_sha256=metadata[str(instance.m)]["sha256"], solution_file="solutions.jsonl")
                     instance_rows.append(row)

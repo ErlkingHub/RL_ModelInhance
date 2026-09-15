@@ -22,6 +22,10 @@
 & 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' train_ConstrainedMKP.py --resources 5 --resume checkpoints/mkp_M5_last.pt --updates 4000
 # 可选：另报 128 条随机轨迹中的最佳解，不替代单轨迹 greedy 结果
 & 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' Benchmark_zeroShot.py --sample-rollouts 128
+# 消融：保留新参数化，关闭同状态排序学习
+& 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' train_ConstrainedMKP.py --ranking-coefficient 0
+# 调整训练分支预算（默认每次更新 16 个状态，每个动作 4 条完整续局）
+& 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' train_ConstrainedMKP.py --counterfactual-states 16 --counterfactual-repeats 4
 ```
 
 其余参数集中在 `mkp_config.py`，包括模型、生成器、PPO、日志、checkpoint、benchmark。`--help` 只显示参数，不运行实验。运行目录不会影响默认数据和产物路径。
@@ -35,6 +39,7 @@
 | `mkp_env.py`              | float64 容量与收益记账，逐步选择，终止与可行候选集合      |
 | `mkp_Model.py`            | 二分图多头 Transformer、高层策略、固定解码器、独立 Critic |
 | `mkp_Trainer.py`          | 完整 episode 采样、GAE、PPO、合成验证、日志、checkpoint   |
+| `mkp_ranking.py`          | 训练专用同状态双分支终局收益、排序损失及排序诊断          |
 | `train_ConstrainedMKP.py` | 简洁训练入口                                              |
 | `Benchmark_zeroShot.py`   | 冻结推理、独立解校验、CSV 与物品序列                      |
 | `mkp_utils.py`            | 复现设置、checkpoint 合约、共享构造过程                   |
@@ -66,11 +71,9 @@ Transformer 的作用是：
 3. 通过各自的 self-attention，让物品之间比较利润与负载，资源之间比较紧张程度和瓶颈；
 4. 对所有节点进行池化，形成全局状态表示；
 5. 高层策略头根据该表示输出低维策略参数 θ，包括：
-   - 资源价格 resource_prices
+   - 有效资源对数权重 resource_log_weights
    - 利润权重 profit_exponent
-   - 稀缺性权重 scarcity_exponent
    - 瓶颈惩罚 bottleneck_weight
-   - 温度 temperature
 随后，固定的弱解码器使用 θ 对当前可行物品打分并选择物品。因此，Transformer 不直接输出每个物品的动作概率，而是根据全局二分图状态调整解码器的策略参数。
 
 ## 模型如何感知状态与约束
@@ -91,27 +94,35 @@ Transformer 的作用是：
 
 ## 高层策略与固定弱解码器
 
-高层每步只输出 M 个正资源价格及 4 个标量，共 M+4 个数：
+高层每步输出 M 个归一化有效资源对数权重和 2 个标量，存储 M+2 个数，**有效自由度为 M+1**：
 
-- `resource_prices`：均值为 1，避免价格尺度冗余。
+- `resource_log_weights`：`logsumexp=0`，其指数 ρ 的和为 1，资源之间有 M−1 个相对权重自由度。
 - `profit_exponent`：收益竞争强度 α。
-- `scarcity_exponent`：资源稀缺性强度 β。
 - `bottleneck_weight`：单一瓶颈占用惩罚 κ。
-- `temperature`：随机策略温度 τ；只影响采样概率，在同一步 greedy 排序中不改变 argmax。
+
+删除的冗余有三部分：
+
+1. 旧资源价格头 `Linear([resource, pooled])` 的 pooled 项和 bias 对每个资源相同，会被 softmax 完全抵消。现在只对包含上下文的资源 embedding 做无 bias 的共享线性映射，并居中、log-softmax。
+2. 旧价格与稀缺指数 β 在同一状态下只通过乘积起作用。令 `ρ ∝ price * (C/c)^(β−1)`，即可用当前容量归一化后的有效权重表达原来的正成本候选排序，消除 β 与 price 的重叠；归一化消除公共价格尺度。零总消耗仍单独使用 eps 成本。
+3. 温度不改变 greedy 排序，现在使用配置 `sampling_temperature=0.2`，不再由 θ 学习。
+
+这里去掉的是评分公式中的结构冗余。单候选、相同资源负载或 M=1 等退化状态仍可能对部分参数不敏感；不能把 θ 数值变化当成策略改善证据。
 
 设 p_i 为收益、w_ij 为占用、C_j 为初始容量、c_j 为当前剩余容量：
 
 ```text
-q_ij    = N * w_ij / C_j
-s_j     = C_j / max(c_j, eps)
-cost_i  = mean_j(price_j * q_ij * s_j ** beta)
+rho_j   = exp(resource_log_weights_j), sum_j rho_j = 1
+q_ij    = N * w_ij / max(c_j, eps)
+cost_i  = sum_j(rho_j * q_ij)
 score_i = alpha * log(max(p_i / mean(p), eps))
           - log(cost_i)
           - kappa * max_j(w_ij / max(c_j, eps))
-pi_i    = softmax(score_i / temperature)，只在可行候选集合中归一化
+pi_i    = softmax(score_i / sampling_temperature)，只在可行候选集合中归一化
 ```
 
-零总资源消耗的物品用 eps 成本处理；数值实现使用 log-sum-exp。默认固定对照为 price=1、α=1、β=1、κ=0.1、τ=0.2。默认网络的高层头初始化在该策略附近，避免把随机劣质起点误当作弱基线。
+零总资源消耗的物品用 eps 成本处理；数值实现使用 log-sum-exp。默认固定对照为 ρ=1/M、α=1、κ=0.1，采样温度 0.2，保留原固定基线的评分公式。默认网络高层头初始化在该策略附近。
+
+Checkpoint 已升级为 schema v2 / `effective_resource_density_v2`，旧 v1 checkpoint 会明确报错，不能直接 resume 或用于当前评估，需要重新训练。已有训练文件不做迁移。你原有的默认 `updates=800` 保持不变。
 
 弱解码器没有可训练参数、物品指针网络、局部搜索、修复、beam search 或优化求解器。每步评分的开销为 O(KM)，K 为可行物品数；整体模型的物品自注意力仍有 O(N²) 开销，不能把弱解码器的速度等同于完整模型推理速度。
 
@@ -120,6 +131,45 @@ pi_i    = softmax(score_i / temperature)，只在可行候选集合中归一化
 训练采用通过固定评分公式诱导的 categorical **物品策略**的 PPO：采样的是物品动作，PPO ratio 使用实际物品的 log probability；梯度沿“概率→固定评分→θ→高层 Transformer”传播。θ 本身不是额外采样的高斯动作，不能用另一套 θ 分布的概率计算 PPO ratio。
 
 单步 reward = 被选物品收益 / 该实例全部物品收益之和。默认 gamma=1，所以累计 reward 与原始总收益同序；容量利用率只记录，不作为额外奖励。没有可行物品即终止；GAE 不跨终止和 batch padding bootstrap。PPO 使用 clipped surrogate、value clipping、梯度裁剪、KL 提前停止和可行性辅助损失。归一化 entropy 在候选数不同时便于比较，单候选和终止状态 entropy 为零。
+
+### 同状态长程排序学习
+
+**“θ 足够好”的操作定义：在同一剩余容量、已选状态和可行候选集合下，把预计最终收益更高的动作排在前面。** 原有 GAE/PPO 已使用后续奖励，但单条轨迹不能直接提供同状态两种选择的收益差，因此新增训练专用的分支比较：
+
+1. 每次更新先完成原有 on-policy rollout。默认选取最多 16 个至少有两个可行候选的状态：一半按可行物品平均最大容量占用比例优先选取，另一半均匀随机抽取。该启发式仅用于覆盖容量紧张状态，不生成好坏标签。
+2. 动作 i 为当前策略排名第一的候选；j 交替选排名第二或均匀随机的其他可行候选，兼顾相近排名和探索。
+3. 完整复制每个状态，分别强制选 i、j；每个动作默认重复 4 次，用**更新前同一套冻结随机策略**继续到终止。两个分支在每步共享按物品索引对应的 Gumbel 随机数，保留各自合法 categorical 分布，减少差分噪声。目标生成使用 `no_grad`，不使用 Critic bootstrap、求解器或最优解标签。
+4. `Q_hat(s,i)` 是从强制动作开始直至终局的归一化累计收益均值；历史收益不计入，两分支的分母均为该实例全部物品收益之和。所有目标在第一个优化器更新前固定，并在本次 PPO epochs 内复用。
+5. 用收益差构造 soft preference，直接约束弱解码器诱导的两个候选相对概率：
+
+```text
+delta  = mean_r [G_r(s,i) - G_r(s,j)]
+target = sigmoid(delta / ranking_return_scale)
+d      = log pi_theta(i|s) - log pi_theta(j|s)
+L_rank = BCEWithLogits(d, target)
+L      = L_PPO + c_v L_value + c_aux L_feasibility - c_ent H
+         + ranking_coefficient * L_rank
+```
+
+收益差的符号和大小共同决定目标；默认 `ranking_return_scale=0.02`，单位是“总物品收益的比例”。只使用 `abs(delta) > max(ranking_min_gap, ranking_se_multiplier * SE)` 的比较，SE 按成对收益差的样本标准误计算，默认阈值为 `max(1e-5, SE)`。这是小样本噪声过滤启发式，不是显著性保证。没有可靠比较时排序损失为零。
+
+默认 `ranking_coefficient=0.1`。每个 PPO minibatch 独立抽最多 8 个已固定目标的状态计算排序项；与 PPO 共用一次反向传播和优化器更新，梯度沿“相对概率 → 固定评分 → θ → Controller”传播。强制动作的分支轨迹不混入 PPO on-policy buffer。除原 sampled-action KL 外，还计算排序状态全部候选的 `KL(old || new)`；任一 KL 超阈值则停止后续更新。与原 PPO 一样，这是更新前的停止检查，不是对单步更新后 KL 的硬保证。
+
+这估计的是当前冻结续局策略下的 `Q^pi_old` 差，包含当前收益和完整未来收益；不声称得到最优续局的 `Q*`。后续策略改进会改变下一轮标签。启用排序学习时要求 `gamma=1`，与最终 profit 目标一致。
+
+分支预算默认最多 `16 × 2 × 4 = 128` 条完整续局/更新，会增加训练耗时；只有合成训练会调用该模块。zero-shot 不产生比较分支，不用排序标签，也不增加推理搜索预算。
+
+### 排序诊断如何读取
+
+`metrics.csv` 新增：
+
+- `ranking_states`、`ranking_reliable_pairs`：比较状态数与通过噪声过滤的数量。
+- `ranking_abs_return_gap`、`ranking_return_gap_se`：所有比较的平均收益差绝对值与标准误。
+- `ranking_loss`、`ranking_kl`：实际执行更新中的排序损失和候选分布 KL。
+- `ranking_pair_accuracy_before` / `ranking_pair_accuracy`：更新前/后的可靠候选对排序正确率，分数完全并列记半分。
+- `ranking_pair_regret_before` / `ranking_pair_regret`：按当前排序在这两个动作中选一个，相对二者较好者损失的归一化终局收益；越小越好，分数并列取一半损失。
+
+这些 before/after 指标使用相同的本轮训练状态及冻结收益标签，不是独立验证，也不是全候选最优动作 regret。先检查可靠比较数量，再观察排序正确率与 regret，最后以独立合成 greedy 验证和 Chu gap 判断是否实际改善。θ 幅度、资源权重差异、entropy 和 attention 集中程度仅是辅助诊断。checkpoint 选择仍依据固定合成验证集的最终收益。
 
 训练实例由随机生成器产生：整数资源占用，三种容量比例，以及以资源平均占用相关收益为主、混合独立收益的分布。这是借鉴 Chu 风格的训练分布，**不是原始数据生成器的精确复现**。固定验证集使用独立随机种子，且只使用训练 N 的合成实例。
 
@@ -136,7 +186,7 @@ pi_i    = softmax(score_i / temperature)，只在可行候选集合中归一化
 
 主要比较 dynamic 对 fixed 的提升，及 dynamic 对 static 的提升，后者检验动态状态感知的价值。`gap_pct = 100 * (best - objective) / best`，其中 best 来自 MAT 文件；仅标记为 **best-known reference**，不声称已经验证其全局最优性。保留负 gap 并标记 `reference_exceeded`，避免截断掩盖数据问题或更好解。
 
-报告包括平均/中位/最差 gap、≤0.1% 的实例比例、原始收益、逐资源利用率、选中数量、可行性、独立重算容量违约量、时间、采样预算和策略统计。只看平均 gap≤0.1% 并不意味着每个实例达标，应同时查看 worst gap 和 target hit rate。时间经过 CUDA 同步，不含 checkpoint 加载，含数据搬运和整条解构造；不做预热，首实例可能包含初始化开销。
+报告包括平均/中位/最差 gap、≤0.1% 的实例比例、原始收益、逐资源利用率、选中数量、可行性、独立重算容量违约量、时间、采样预算和策略统计。策略统计为 α、κ 和有效资源权重标准差，不再输出已删除的 β、learned temperature 或旧价格字段。只看平均 gap≤0.1% 并不意味着每个实例达标，应同时查看 worst gap 和 target hit rate。时间经过 CUDA 同步，不含 checkpoint 加载，含数据搬运和整条解构造；不做预热，首实例可能包含初始化开销。
 
 新增数据集：若遵循现有 `read_mat` 字段布局，可使用 `--dataset`；其他布局应新增读取适配器，统一转换为 `MKPInstance`。不猜测未知 MAT 格式，也不把缺失 best 当成零 gap。
 
@@ -150,7 +200,7 @@ pi_i    = softmax(score_i / temperature)，只在可行候选集合中归一化
 
 ## 交付验证
 
-`tests/test_contracts.py` 只检查小张量上的候选概率、固定公式、约束拒绝、终止/GAE、排列等变性、高层梯度、checkpoint 往返及独立解校验；不含优化器更新、训练 episode 或 Chu 推理。训练收敛性、实际 GPU 内存/速度和最终 gap 需在正式实验中验证。
+`tests/test_contracts.py` 和 `tests/test_ranking.py` 检查小张量上的候选概率、公式等价性、约束拒绝、终止/GAE、排列等变性、高层梯度、checkpoint 往返及独立解校验。排序测试包含小型人工实例的完整续局和 PPO 联合反向传播，使用空操作的 optimizer 接口，不做参数更新。反例验证“立即收益 8 的动作最终得到 8，而立即收益 6 的动作最终得到 12”时，排序梯度能反对即时贪心。完整训练、Chu 推理、收敛性、实际训练 GPU 内存/速度和最终 gap 留给正式实验验证。
 
 
 ## 全流程如下：
@@ -178,11 +228,9 @@ pi_i    = softmax(score_i / temperature)，只在可行候选集合中归一化
    对物品节点和资源节点分别平均池化，并与全局特征拼接，得到全局状态表示 pooled。
 6. 高层策略生成
    pooled 输入高层策略头，输出策略参数 θ：
-   - 资源价格
+   - 归一化有效资源权重（由资源 embedding 的独立头输出）
    - 利润权重
-   - 稀缺性权重
    - 瓶颈惩罚权重
-   - 温度参数
 7. 弱解码器评分
    固定弱解码器使用 θ 对当前可行物品评分。Transformer 不直接生成物品 logits，只调节评分公式中的策略参数。
 8. 选择动作
@@ -207,4 +255,4 @@ MKP实例
 → 可行物品动作
 → 状态更新与奖励
 → 循环
-训练时，PPO 根据实际物品动作的概率更新 Transformer 和高层策略；Critic 使用独立的二分图编码器估计状态价值。
+训练时，PPO 根据实际物品动作的概率更新 Transformer 和高层策略，并联合同状态终局收益差的排序损失；Critic 使用独立的二分图编码器估计状态价值。

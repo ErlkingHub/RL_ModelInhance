@@ -115,15 +115,13 @@ class BipartiteEncoder(nn.Module):
 
 @dataclass
 class StrategyTheta:
-    resource_prices: torch.Tensor  # [B, M], strictly positive, mean 1
+    resource_log_weights: torch.Tensor  # [B, M], logsumexp=0: M-1 effective DOF
     profit_exponent: torch.Tensor # [B]
-    scarcity_exponent: torch.Tensor
     bottleneck_weight: torch.Tensor
-    temperature: torch.Tensor
 
     def detach(self):
-        return StrategyTheta(*(x.detach() for x in (self.resource_prices, self.profit_exponent,
-                             self.scarcity_exponent, self.bottleneck_weight, self.temperature)))
+        return StrategyTheta(*(x.detach() for x in (self.resource_log_weights,
+                             self.profit_exponent, self.bottleneck_weight)))
 
 
 class HighLevelController(nn.Module):
@@ -131,17 +129,17 @@ class HighLevelController(nn.Module):
         super().__init__()
         self.config = config
         self.encoder = BipartiteEncoder(config)
-        self.price_head = nn.Linear(2 * config.embed_dim, 1)
-        self.strategy_head = nn.Linear(config.embed_dim, 4)
+        # A shared linear pooled term and bias would cancel in log_softmax.
+        # Resource embeddings already contain global context from the encoder.
+        self.price_head = nn.Linear(config.embed_dim, 1, bias=False)
+        self.strategy_head = nn.Linear(config.embed_dim, 2)
         # Auxiliary state supervision only. Its item outputs never enter decoder scores.
         self.feasibility_head = nn.Linear(config.embed_dim, 1)
         nn.init.zeros_(self.price_head.weight)
-        nn.init.zeros_(self.price_head.bias)
         nn.init.zeros_(self.strategy_head.weight)
-        defaults = (1.0, 1.0, 0.1, 0.2)
+        defaults = (1.0, 0.1)
         bounds = ((config.profit_exponent_min, config.profit_exponent_max),
-                  (0, config.scarcity_exponent_max), (0, config.bottleneck_weight_max),
-                  (config.temperature_min, config.temperature_max))
+                  (0, config.bottleneck_weight_max))
         with torch.no_grad():
             for j, (v, (lo, hi)) in enumerate(zip(defaults, bounds)):
                 fraction = min(0.999, max(0.001, (v - lo) / (hi - lo))) if hi > lo else 0.5
@@ -150,15 +148,13 @@ class HighLevelController(nn.Module):
     def forward(self, state):
         items, resources, pooled = self.encoder(state)
         c = self.config
-        m = resources.shape[1]
-        price_logits = self.price_head(torch.cat((resources, pooled[:, None, :].expand_as(resources)), -1)).squeeze(-1)
-        prices = c.price_floor + (1 - c.price_floor) * m * price_logits.softmax(-1)
+        price_logits = self.price_head(resources - resources.mean(1, keepdim=True)).squeeze(-1)
+        log_weights = price_logits.log_softmax(-1)
         controls = self.strategy_head(pooled).sigmoid()
         theta = StrategyTheta(
-            prices,
+            log_weights,
             c.profit_exponent_min + (c.profit_exponent_max - c.profit_exponent_min) * controls[:, 0],
-            c.scarcity_exponent_max * controls[:, 1], c.bottleneck_weight_max * controls[:, 2],
-            c.temperature_min + (c.temperature_max - c.temperature_min) * controls[:, 3])
+            c.bottleneck_weight_max * controls[:, 1])
         return theta, self.feasibility_head(items).squeeze(-1)
 
 
@@ -177,11 +173,15 @@ class CandidatePolicy:
         total = logits.new_zeros(batch_size).scatter_add(0, owners, centered.exp())
         self.log_probs = centered - total[owners].log()
 
-    def choose(self, stochastic=False):
+    def choose(self, stochastic=False, gumbels=None):
         values = self.log_probs
         if stochastic:
-            uniform = torch.rand_like(values).clamp(1e-7, 1 - 1e-7)
-            values = values - (-uniform.log()).log()
+            if gumbels is None:
+                uniform = torch.rand_like(values).clamp(1e-7, 1 - 1e-7)
+                values = values - (-uniform.log()).log()
+            else:
+                # Dense item-indexed shared noise for paired training continuations.
+                values = values + gumbels[self.owners, self.items]
         maxima = values.new_full((self.batch_size,), -torch.inf)
         maxima.scatter_reduce_(0, self.owners, values, reduce="amax", include_self=True)
         # Exact ties use the smallest original item index; empty rows receive -1.
@@ -209,11 +209,11 @@ class CandidatePolicy:
 class WeakDecoder:
     """No nn.Module, trainable weight, pointer, search, local repair or solver.
 
-    q_ij = N * w_ij / C_j ; s_j = C_j / max(c_j, eps)
-    cost_i = mean_j(price_j * q_ij * s_j ** beta)
+    rho_j = exp(theta.resource_log_weights_j), sum_j rho_j = 1
+    cost_i = sum_j(rho_j * N * w_ij / max(c_j, eps))
     score_i = alpha * log(p_i / mean(p)) - log(cost_i)
               - kappa * max_j(w_ij / max(c_j, eps))
-    pi(i|s) = softmax(score_i / temperature) over feasible candidates.
+    pi(i|s) = softmax(score_i / fixed_temperature) over feasible candidates.
     """
     def __init__(self, config: ModelConfig):
         self.config = config
@@ -221,34 +221,30 @@ class WeakDecoder:
     def fixed_theta(self, state):
         b, m = state.capacities.shape
         device = state.profits.device
-        return StrategyTheta(torch.ones(b, m, device=device), torch.ones(b, device=device),
-                             torch.ones(b, device=device), torch.full((b,), 0.1, device=device),
-                             torch.full((b,), 0.2, device=device))
+        return StrategyTheta(torch.full((b, m), -math.log(m), device=device),
+                             torch.ones(b, device=device), torch.full((b,), 0.1, device=device))
 
     def __call__(self, state, theta):
         owners, items = state.feasible.nonzero(as_tuple=True)
         eps = self.config.eps
-        p, w, c, rem = (x.float() for x in
-                        (state.profits, state.weights, state.capacities, state.remaining))
+        p, w, rem = (x.float() for x in (state.profits, state.weights, state.remaining))
         # Calculate only feasible-item scores; infeasible nodes still entered the encoder.
         candidate_w = w[owners, items]
         scale = state.profits.shape[1]
-        log_scarcity = (c[owners].clamp_min(eps).log() - rem[owners].clamp_min(eps).log())
         # Log-space cost avoids overflow when a resource is exhausted (zero loads are legal).
         zero_cost = (candidate_w == 0).all(-1)
-        log_load = (scale * candidate_w / c[owners]).clamp_min(eps).log()
+        log_load = (scale * candidate_w / rem[owners].clamp_min(eps)).clamp_min(eps).log()
         # -inf here represents a zero summand in a resource cost, never an item logit.
         log_load = torch.where(candidate_w > 0, log_load, -torch.inf)
-        log_components = (theta.resource_prices[owners].log() + log_load
-                          + theta.scarcity_exponent[owners, None] * log_scarcity)
+        log_components = theta.resource_log_weights[owners] + log_load
         log_components = torch.where(zero_cost[:, None], torch.zeros_like(log_components), log_components)
-        log_cost = torch.logsumexp(log_components, -1) - math.log(c.shape[-1])
+        log_cost = torch.logsumexp(log_components, -1)
         log_cost = torch.where(zero_cost, log_cost.new_full(log_cost.shape, math.log(eps)), log_cost)
         profit = p[owners, items] / p.mean(-1)[owners].clamp_min(eps)
         bottleneck = (candidate_w / rem[owners].clamp_min(eps)).amax(-1)
         scores = theta.profit_exponent[owners] * profit.clamp_min(eps).log() - log_cost
         scores = scores - theta.bottleneck_weight[owners] * bottleneck
-        return CandidatePolicy(owners, items, scores / theta.temperature[owners], p.shape[0])
+        return CandidatePolicy(owners, items, scores / self.config.sampling_temperature, p.shape[0])
 
 
 class MKPModel(nn.Module):

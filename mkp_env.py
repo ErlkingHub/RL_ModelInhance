@@ -26,6 +26,14 @@ class MKPState:
 
 
 class MKPEnv:
+    @classmethod
+    def from_state(cls, state):
+        """Independent branch of a valid environment state (including terminal rows)."""
+        env = cls(state.profits, state.weights, state.capacities)
+        env.state.remaining = state.remaining.double().clone()
+        env.state.selected = state.selected.clone()
+        return env
+
     def __init__(self, profits, weights, capacities):
         if profits.ndim != 2 or weights.ndim != 3 or capacities.ndim != 2:
             raise ValueError("Expected P[B,N], R[B,N,M], B[B,M]")

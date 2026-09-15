@@ -62,9 +62,9 @@ class Contracts(unittest.TestCase):
         actual = decoder(state, theta)
         rows, cols = state.feasible.nonzero(as_tuple=True)
         w, c, rem = state.weights.float()[rows, cols], state.capacities.float()[rows], state.remaining.float()[rows]
-        cost = (theta.resource_prices[rows] * (4 * w / c) * (c / rem).pow(theta.scarcity_exponent[rows, None])).mean(-1)
+        cost = (theta.resource_log_weights[rows].exp() * (4 * w / rem)).sum(-1)
         expected = (theta.profit_exponent[rows] * (state.profits.float()[rows, cols] / state.profits.float().mean(-1)[rows]).log()
-                    - cost.log() - theta.bottleneck_weight[rows] * (w / rem).amax(-1)) / theta.temperature[rows]
+                    - cost.log() - theta.bottleneck_weight[rows] * (w / rem).amax(-1)) / self.config.sampling_temperature
         self.assertTrue(torch.allclose(actual.logits, expected, atol=1e-5))
 
     def test_exhausted_resource_zero_weights_and_no_candidates(self):
@@ -94,7 +94,7 @@ class Contracts(unittest.TestCase):
         with torch.no_grad():
             original, value, theta, _ = model(state)
             reordered, perm_value, perm_theta, _ = model(permuted)
-        self.assertTrue(torch.allclose(theta.resource_prices[:, resources], perm_theta.resource_prices, atol=1e-5))
+        self.assertTrue(torch.allclose(theta.resource_log_weights[:, resources], perm_theta.resource_log_weights, atol=1e-5))
         self.assertTrue(torch.allclose(theta.profit_exponent, perm_theta.profit_exponent, atol=1e-5))
         self.assertTrue(torch.allclose(value, perm_value, atol=1e-5))
         probs = {(b, i): p for b, i, p in zip(original.owners.tolist(), original.items.tolist(), original.log_probs.exp().tolist())}
@@ -110,7 +110,7 @@ class Contracts(unittest.TestCase):
         actions = policy.choose(stochastic=True)
         self.assertTrue(state.feasible[0, actions[0]])
         self.assertEqual(actions[1].item(), -1)
-        self.assertTrue(torch.allclose(theta.resource_prices.mean(-1), torch.ones(2)))
+        self.assertTrue(torch.allclose(theta.resource_log_weights.exp().sum(-1), torch.ones(2)))
         loss = -policy.log_prob(actions)[0] + value.square().mean() + auxiliary.square().mean()
         loss.backward()
         self.assertGreater(model.actor.strategy_head.weight.grad.abs().sum().item(), 0)

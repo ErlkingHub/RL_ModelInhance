@@ -16,6 +16,7 @@ from mkp_config import (CHECKPOINT_VERSION, DECODER_VERSION, ModelConfig, Genera
 from mkp_data import synthetic_batch
 from mkp_env import MKPEnv, MKPState
 from mkp_Model import MKPModel
+from mkp_ranking import collect_ranking_batch, ranking_loss, ranking_metrics
 from mkp_utils import (atomic_checkpoint, construct_solution, load_checkpoint, resolve_device,
                        seed_everything, write_json)
 
@@ -87,6 +88,9 @@ class MKPTrainer:
                        "entropy", "approx_kl", "clip_fraction", "grad_norm", "explained_variance",
                        "minibatches", "kl_stopped", "validation_return", "validation_improvement_pct",
                        "best_validation_return", "elapsed_seconds"]
+        self.fields += ["ranking_loss", "ranking_kl", "ranking_states", "ranking_reliable_pairs",
+                        "ranking_abs_return_gap", "ranking_return_gap_se", "ranking_pair_accuracy",
+                        "ranking_pair_regret", "ranking_pair_accuracy_before", "ranking_pair_regret_before"]
         with (self.run_dir / "metrics.csv").open("w", newline="", encoding="utf-8") as f:
             csv.DictWriter(f, fieldnames=self.fields).writeheader()
         write_json(self.run_dir / "config.json", {
@@ -96,6 +100,10 @@ class MKPTrainer:
 
     def ppo_update(self, model, optimizer, data, rollout):
         c = self.config
+        # Must finish all branch targets before the first optimizer step. Nothing
+        # from these forced branches is inserted into the on-policy PPO buffer.
+        ranking = collect_ranking_batch(model, data, rollout, c)
+        before = ranking_metrics(model, ranking)
         advantages, returns = generalized_advantage(rollout["rewards"], rollout["values"],
             rollout["dones"], rollout["active"], c.gamma, c.gae_lambda)
         times, batches = rollout["active"].nonzero(as_tuple=True)
@@ -107,7 +115,7 @@ class MKPTrainer:
         actions = rollout["actions"][times, batches]
         model.train()
         sums = {k: 0.0 for k in ("policy_loss", "value_loss", "constraint_aux_loss", "entropy",
-                                "approx_kl", "clip_fraction", "grad_norm")}
+                                "approx_kl", "clip_fraction", "grad_norm", "ranking_loss", "ranking_kl")}
         minibatches, observations, stopped = 0, 0, False
         for _ in range(c.ppo_epochs):
             order = torch.randperm(times.numel(), device=self.device)
@@ -119,9 +127,13 @@ class MKPTrainer:
                 log_ratio = policy.log_prob(actions[ids]) - old_log_probs[ids]
                 ratio = log_ratio.exp()
                 approximate_kl = ((ratio - 1) - log_ratio).mean()
-                if not torch.isfinite(approximate_kl):
+                pair_loss, pair_kl = values.sum() * 0, values.new_zeros(())
+                if ranking is not None:
+                    pair_ids = torch.randperm(ranking.actions.shape[0], device=self.device)[:c.ranking_minibatch_size]
+                    pair_loss, pair_kl = ranking_loss(model, ranking, pair_ids, c)
+                if not torch.isfinite(approximate_kl) or not torch.isfinite(pair_kl):
                     raise FloatingPointError("Non-finite PPO probability ratio")
-                if approximate_kl.item() > c.target_kl:
+                if max(approximate_kl.item(), pair_kl.item()) > c.target_kl:
                     stopped = True
                     break
                 surrogate = ratio * normalized_adv[ids]
@@ -133,7 +145,8 @@ class MKPTrainer:
                 constraint_loss = F.binary_cross_entropy_with_logits(constraint_logits, state.feasible.float())
                 entropy = policy.normalized_entropy().mean()
                 loss = (policy_loss + c.value_coefficient * value_loss
-                        + c.constraint_aux_coefficient * constraint_loss - c.entropy_coefficient * entropy)
+                        + c.constraint_aux_coefficient * constraint_loss - c.entropy_coefficient * entropy
+                        + c.ranking_coefficient * pair_loss)
                 if not torch.isfinite(loss):
                     raise FloatingPointError("Non-finite PPO loss")
                 optimizer.zero_grad(set_to_none=True)
@@ -142,7 +155,7 @@ class MKPTrainer:
                                                           error_if_nonfinite=True)
                 optimizer.step()
                 metrics = (policy_loss, value_loss, constraint_loss, entropy, approximate_kl,
-                           ((ratio - 1).abs() > c.clip_ratio).float().mean(), grad_norm)
+                           ((ratio - 1).abs() > c.clip_ratio).float().mean(), grad_norm, pair_loss, pair_kl)
                 for key, val in zip(sums, metrics):
                     sums[key] += val.detach().item() * ids.numel()
                 observations += ids.numel()
@@ -153,6 +166,9 @@ class MKPTrainer:
         explained = (1 - (targets - old_values).var(unbiased=False) / variance).item() if variance > 1e-12 else float("nan")
         result = {k: v / max(1, observations) for k, v in sums.items()}
         result.update(minibatches=minibatches, kl_stopped=int(stopped), explained_variance=explained)
+        result.update(ranking_metrics(model, ranking))
+        result.update(ranking_pair_accuracy_before=before["ranking_pair_accuracy"],
+                      ranking_pair_regret_before=before["ranking_pair_regret"])
         return result
 
     def train(self, resume=None):
@@ -229,9 +245,11 @@ class MKPTrainer:
                        best_validation_return=best, elapsed_seconds=time.perf_counter() - began)
             with (self.run_dir / "metrics.csv").open("a", newline="", encoding="utf-8") as f:
                 csv.DictWriter(f, fieldnames=self.fields).writerow(row)
-            self.logger.info("M=%d update=%d/%d N=%d reward=%.5f policy=%.5f value=%.5f KL=%.5f val=%s",
+            self.logger.info("M=%d update=%d/%d N=%d reward=%.5f policy=%.5f value=%.5f KL=%.5f rank=%.5f pair_acc=%.3f pair_regret=%.6f pairs=%d/%d val=%s",
                              m, update, c.updates, n, row["normalized_return"], stats["policy_loss"],
-                             stats["value_loss"], stats["approx_kl"], validation_return)
+                             stats["value_loss"], stats["approx_kl"], stats["ranking_loss"],
+                             stats["ranking_pair_accuracy"], stats["ranking_pair_regret"],
+                             stats["ranking_reliable_pairs"], stats["ranking_states"], validation_return)
             if improved or update % c.checkpoint_every == 0 or update == c.updates:
                 payload = {"checkpoint_version": CHECKPOINT_VERSION, "decoder_version": DECODER_VERSION,
                            "model_config": config_dict(self.model_config), "train_config": config_dict(c),
@@ -259,8 +277,17 @@ def main(argv=None):
     parser.add_argument("--device", default=defaults.device)
     parser.add_argument("--seed", type=int, default=defaults.seed)
     parser.add_argument("--resume", default=None)
+    parser.add_argument("--ranking-coefficient", type=float, default=defaults.ranking_coefficient)
+    parser.add_argument("--counterfactual-states", type=int, default=defaults.counterfactual_states)
+    parser.add_argument("--counterfactual-repeats", type=int, default=defaults.counterfactual_repeats)
+    parser.add_argument("--ranking-minibatch-size", type=int, default=defaults.ranking_minibatch_size)
+    parser.add_argument("--ranking-return-scale", type=float, default=defaults.ranking_return_scale)
     args = parser.parse_args(argv)
     config = TrainConfig(num_resources=tuple(args.resources), train_num_items=tuple(args.train_items),
                          updates=args.updates, batch_size=args.batch_size, minibatch_size=args.minibatch_size,
-                         device=args.device, seed=args.seed)
+                         device=args.device, seed=args.seed, ranking_coefficient=args.ranking_coefficient,
+                         counterfactual_states=args.counterfactual_states,
+                         counterfactual_repeats=args.counterfactual_repeats,
+                         ranking_minibatch_size=args.ranking_minibatch_size,
+                         ranking_return_scale=args.ranking_return_scale)
     MKPTrainer(config).train(args.resume)

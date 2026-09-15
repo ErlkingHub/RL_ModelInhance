@@ -84,7 +84,7 @@ def construct_solution(data, model=None, mode="learned_dynamic", stochastic=Fals
     if mode == "learned_static":
         theta = model.actor(env.state)[0]
     sequences = []
-    theta_sum = torch.zeros(data[0].shape[0], 5, device=data[0].device)
+    theta_sum = torch.zeros(data[0].shape[0], 3, device=data[0].device)
     theta_count = torch.zeros(data[0].shape[0], device=data[0].device)
     for _ in range(data[0].shape[1]):
         active = env.state.active
@@ -94,9 +94,8 @@ def construct_solution(data, model=None, mode="learned_dynamic", stochastic=Fals
             theta = model.actor(env.state)[0]
         policy = decoder(env.state, theta)
         actions = policy.choose(stochastic)
-        stats = torch.stack((theta.profit_exponent, theta.scarcity_exponent,
-                             theta.bottleneck_weight, theta.temperature,
-                             theta.resource_prices.std(-1, unbiased=False)), dim=-1)
+        stats = torch.stack((theta.profit_exponent, theta.bottleneck_weight,
+                             theta.resource_log_weights.exp().std(-1, unbiased=False)), dim=-1)
         theta_sum += stats * active[:, None]
         theta_count += active
         sequences.append(actions)

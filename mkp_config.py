@@ -3,14 +3,14 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-CHECKPOINT_VERSION = 1
-DECODER_VERSION = "resource_price_density_v1"
+CHECKPOINT_VERSION = 2
+DECODER_VERSION = "effective_resource_density_v2"
 
 @dataclass
 class TrainConfig:
     num_resources: tuple[int, ...] = (5, 10)
     train_num_items: tuple[int, ...] = (100,)
-    updates: int = 2000
+    updates: int = 800
     batch_size: int = 64
     minibatch_size: int = 128
     ppo_epochs: int = 3
@@ -22,6 +22,14 @@ class TrainConfig:
     value_coefficient: float = 0.5
     entropy_coefficient: float = 0.01
     constraint_aux_coefficient: float = 0.05
+    # Training-only same-state terminal-return comparisons, frozen before PPO.
+    ranking_coefficient: float = 0.1
+    counterfactual_states: int = 16
+    counterfactual_repeats: int = 4
+    ranking_minibatch_size: int = 8
+    ranking_return_scale: float = 0.02  # units: profit / total instance profit
+    ranking_min_gap: float = 1e-5
+    ranking_se_multiplier: float = 1.0
     max_grad_norm: float = 1.0
     target_kl: float = 0.03
     validation_every: int = 25
@@ -47,11 +55,17 @@ class TrainConfig:
             raise ValueError("train_num_items must be positive")
         if not 0 < self.gamma <= 1 or not 0 <= self.gae_lambda <= 1:
             raise ValueError("Invalid GAE parameters")
+        if self.ranking_coefficient > 0 and self.gamma != 1:
+            raise ValueError("Terminal-profit ranking requires gamma=1 for objective alignment")
         if self.learning_rate <= 0 or not 0 < self.clip_ratio < 1 or self.value_clip <= 0:
             raise ValueError("Invalid optimizer or PPO parameters")
         if min(self.value_coefficient, self.entropy_coefficient,
-               self.constraint_aux_coefficient) < 0:
+               self.constraint_aux_coefficient, self.ranking_coefficient) < 0:
             raise ValueError("Loss coefficients must be nonnegative")
+        if self.counterfactual_states < 1 or self.counterfactual_repeats < 2 or self.ranking_minibatch_size < 1:
+            raise ValueError("Counterfactual budgets must be positive; repeats must be >= 2")
+        if self.ranking_return_scale <= 0 or self.ranking_min_gap < 0 or self.ranking_se_multiplier < 0:
+            raise ValueError("Invalid ranking target scale or confidence threshold")
         if self.max_grad_norm <= 0 or self.target_kl <= 0:
             raise ValueError("Gradient norm and target KL must be positive")
         self.runs_dir, self.checkpoint_dir = Path(self.runs_dir), Path(self.checkpoint_dir)
@@ -64,13 +78,10 @@ class ModelConfig:
     num_layers: int = 2
     ff_multiplier: int = 4
     # No positional embeddings: item/resource order must not encode identity.
-    price_floor: float = 0.05
     profit_exponent_min: float = 0.5
     profit_exponent_max: float = 2.0
-    scarcity_exponent_max: float = 2.0
     bottleneck_weight_max: float = 2.0
-    temperature_min: float = 0.05
-    temperature_max: float = 1.0
+    sampling_temperature: float = 0.2  # fixed exploration setting, outside theta
     feature_clip: float = 100.0
     eps: float = 1e-8
 
@@ -79,13 +90,11 @@ class ModelConfig:
             raise ValueError("embed_dim must be positive and divisible by num_heads")
         if self.num_layers < 1 or self.ff_multiplier < 1:
             raise ValueError("num_layers and ff_multiplier must be positive")
-        if not 0 < self.price_floor < 1:
-            raise ValueError("price_floor must be in (0, 1)")
-        if not 0 < self.temperature_min <= self.temperature_max:
-            raise ValueError("Invalid temperature range")
+        if self.sampling_temperature <= 0:
+            raise ValueError("sampling_temperature must be positive")
         if not 0 < self.profit_exponent_min <= self.profit_exponent_max:
             raise ValueError("Invalid profit exponent range")
-        if self.scarcity_exponent_max < 0 or self.bottleneck_weight_max < 0:
+        if self.bottleneck_weight_max < 0:
             raise ValueError("Strategy ranges must be nonnegative")
         if self.eps <= 0 or self.feature_clip <= 0:
             raise ValueError("eps and feature_clip must be positive")
