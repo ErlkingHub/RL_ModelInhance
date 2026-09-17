@@ -52,6 +52,48 @@
 
 重新训练会更新同一 M 的标准 checkpoint 文件名；日志目录保留每次配置。继续训练时保留原模型、数据分布、训练 N 和固定验证设置。
 
+## 收敛诊断与训练曲线
+
+直接按上面的两条命令运行训练和 Benchmark 即可。`TrainConfig.updates=8000` 仍是每个 M 的完整训练预算；诊断不提前停止训练。每个 M 训练结束后自动生成：
+
+- `runs/<时间戳>/convergence_M5.json`、`convergence_M10.json`：最终收敛判定及阈值。
+- `runs/<时间戳>/plots/training_M5.png`、`training_M10.png`，以及同名 SVG：12 个子图，包括固定验证收益、训练 return、归一化 policy entropy、policy/value/辅助损失、approx KL、clip fraction、梯度范数、explained variance、容量利用率、KL 提前停止频率。浅色为原始数据，深色为最近 100 updates 的均值；验证曲线不平滑。
+- `runs/<时间戳>/diagnostics_history_M*.json`：绘图历史，续训时包含新版本 checkpoint 中继承的记录。
+- `results/<时间戳>/training_convergence.json`：Benchmark 完成后，将每个 M 的实际被测 checkpoint update、SHA256、该 checkpoint 的平均 gap 与来源训练的收敛报告关联起来。**该 gap 不代表平台起点模型的 gap**。
+
+### 收敛点的含义
+
+判据使用固定、独立的**合成验证集 greedy 归一化收益**，不使用训练 loss、entropy 或 Chu 测试集选择收敛点。Entropy/KL 等曲线用于解释策略行为，性能进入平台并不要求策略分布完全静止。
+
+默认从最近一次验证向前寻找连续区间，要求每一次验证收益都不低于历史最佳收益的 `99.95%`，即相对差距不超过 `0.05%`。例如最佳 return 为 `0.5`，容许的绝对差为 `0.00025`。该区间须跨越至少 1000 updates、包含至少 20 次验证，且确认时累计 update 不小于 1000。默认每 25 updates 验证一次，起点精度受验证间隔限制。
+
+| TrainConfig 参数 | 默认值 | 含义 |
+| --- | --- | --- |
+| `convergence_tolerance_pct` | `0.05` | 相对最佳验证收益的百分比容差，不是 Benchmark gap 百分点 |
+| `convergence_patience_updates` | `1000` | 连续平台至少跨越的 update 数 |
+| `convergence_min_evaluations` | `20` | 平台至少包含的有效验证次数 |
+| `convergence_min_updates` | `1000` | 最早允许确认平台的累计 update |
+| `plot_smoothing_updates` | `100` | RL 曲线平滑窗口，仅影响显示 |
+
+`train.log` 中搜索 `CONVERGENCE_FINAL`，每个 M 分别报告：
+
+- `plateau_start_update`：最终仍成立的平台起点；图中用**红色实线**标记。
+- `confirmation_update`：观察长度足够、满足上述条件的确认点；图中用**橙色虚线**标记。以后若考虑早停预算，应参考确认点，因为在平台起点尚无后续证据。
+- `best_update`：验证收益最高的 update，与收敛点分开；图中用紫色星号标记，Benchmark 默认仍评估 `best.pt`。
+- `status=converged`：截至本次训练结束满足性能平台判据；`not_converged` / `insufficient_history` 表示尚未确认，不会强制画一个收敛点。
+
+训练中 `CONVERGENCE_CANDIDATE` 只表示临时判断；后期提升或退化会使候选失效，最终以 `CONVERGENCE_FINAL` 为准。这是有限训练预算内、阈值明确的性能平台诊断，不能证明继续训练永远不会进步，也不能证明 Chu gap 同时收敛。训练和 checkpoint 选择仍只使用合成数据。
+
+新 checkpoint 保存诊断历史，因此续训会延续判断；旧 checkpoint 没有历史时，会在日志提示仅从续训段积累证据，并保留旧 best 收益作为参照，避免把退化后的稳定误判成收敛。
+
+只重绘已有日志（不训练、不评估）：
+
+```powershell
+python mkp_diagnostics.py runs/<时间戳>
+```
+
+绘图依赖 `matplotlib`；训练开始前会检查能否加载，避免长时间训练结束后才发现缺少绘图依赖。现有合约测试与新增诊断测试可用 `python -m unittest discover -s tests -v` 执行；新增流程测试使用模拟 rollout 和 PPO 指标，不执行真实优化或 Chu 推理。
+
 ## 当前代码中的二分图可以概括为：
 - 左侧节点：N 个物品节点。每个节点包含利润、初始资源消耗、当前可行性、是否已选择等 8 维特征。
 - 右侧节点：M 个资源节点。每个节点包含剩余容量比例、资源需求、已选择比例、可行物品比例等 6 维特征。

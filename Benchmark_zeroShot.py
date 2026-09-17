@@ -104,6 +104,21 @@ def write_csv(path, rows):
         writer.writerows(rows)
 
 
+def training_diagnostics(payload, m):
+    """Attach the originating training report without using Chu to tune/select models."""
+    run_dir = payload.get("run_dir")
+    info = {"run_dir": run_dir, "checkpoint_update": payload["update"],
+            "report_status": "unavailable", "convergence": None}
+    if run_dir:
+        path = Path(run_dir) / f"convergence_M{m}.json"
+        if path.is_file():
+            report = json.loads(path.read_text(encoding="utf-8"))
+            if (report.get("M") == m and report.get("training_complete")
+                    and report.get("final_update", -1) >= payload["update"]):
+                info.update(report_status="available", convergence=report)
+    return info
+
+
 def benchmark(config=None):
     c = config or BenchmarkConfig()
     device = resolve_device(c.device)
@@ -120,7 +135,8 @@ def benchmark(config=None):
         metadata[str(m)] = {"path": str(checkpoint.resolve()), "sha256": file_sha256(checkpoint),
                             "update": payload["update"], "model_config": payload["model_config"],
                             "train_num_items": payload["train_config"]["train_num_items"],
-                            "training_data_source": payload["training_data_source"]}
+                            "training_data_source": payload["training_data_source"],
+                            "training_diagnostics": training_diagnostics(payload, m)}
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     output = c.results_dir / stamp
     output.mkdir(parents=True, exist_ok=False)
@@ -197,6 +213,16 @@ def benchmark(config=None):
             write_json(output / "manifest.json", manifest)
             raise
     write_csv(output / "summary.csv", summarize(rows))
+    # Each gap is for this evaluated checkpoint, not the historical plateau-start model.
+    training_links = []
+    for m, meta in metadata.items():
+        group = [r for r in rows if r["M"] == int(m) and r["method"] == "learned_dynamic"
+                 and r["gap_pct"] is not None]
+        training_links.append({"M": int(m), "checkpoint_update": meta["update"],
+                               "checkpoint_sha256": meta["sha256"],
+                               "evaluated_checkpoint_mean_gap_pct": float(np.mean([r["gap_pct"] for r in group])) if group else None,
+                               **meta["training_diagnostics"]})
+    write_json(output / "training_convergence.json", training_links)
     manifest.update(status="complete", completed_rows=len(rows))
     write_json(output / "manifest.json", manifest)
     print(f"Results: {output}")

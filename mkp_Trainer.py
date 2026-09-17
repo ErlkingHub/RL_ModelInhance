@@ -16,6 +16,7 @@ from mkp_config import (CHECKPOINT_VERSION, DECODER_VERSION, ModelConfig, Genera
 from mkp_data import synthetic_batch
 from mkp_env import MKPEnv, MKPState
 from mkp_Model import MKPModel
+from mkp_diagnostics import convergence_report, plot_training, prepare_plotting
 from mkp_utils import (atomic_checkpoint, construct_solution, load_checkpoint, resolve_device,
                        seed_everything, write_json)
 
@@ -159,6 +160,7 @@ class MKPTrainer:
         if resume is not None and len(self.config.num_resources) != 1:
             raise ValueError("--resume requires exactly one --resources value")
         try:
+            prepare_plotting()
             for m in self.config.num_resources:
                 self._train_shape(m, resume)
         finally:
@@ -173,6 +175,7 @@ class MKPTrainer:
         model = MKPModel(self.model_config).to(self.device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=c.learning_rate, weight_decay=0.0)
         start, best = 1, -float("inf")
+        history = []
         saved = None
         if resume:
             model, saved = load_checkpoint(resume, self.device, m)
@@ -189,6 +192,10 @@ class MKPTrainer:
             for group in optimizer.param_groups:
                 group["lr"] = c.learning_rate
             start, best = saved["update"] + 1, saved["best_validation_return"]
+            history = saved.get("diagnostics_history", [])
+            if not history:
+                self.logger.warning("M=%d resume checkpoint has no diagnostics history; convergence evidence starts at update=%d",
+                                    m, start)
             if start > c.updates:
                 raise ValueError("--updates is the total target and must exceed the resumed update")
         # Fixed held-out synthetic validation has an independent RNG and only training N shapes.
@@ -207,6 +214,11 @@ class MKPTrainer:
         self.logger.info("M=%s | device=%s | parameters=%s | synthetic N=%s | updates=%s..%s",
                          m, self.device, sum(p.numel() for p in model.parameters()), c.train_num_items, start, c.updates)
         began = time.perf_counter()
+        previous_plateau = None
+        self.logger.info("M=%d CONVERGENCE_RULE | synthetic greedy validation within %.4f%% of best | "
+                         "span>=%d updates | evaluations>=%d | confirmation update>=%d | training continues to %d",
+                         m, c.convergence_tolerance_pct, c.convergence_patience_updates,
+                         c.convergence_min_evaluations, c.convergence_min_updates, c.updates)
         for update in range(start, c.updates + 1):
             n = int(rng.choice(c.train_num_items))
             data = synthetic_batch(c.batch_size, n, m, self.generator_config, rng, self.device)
@@ -227,16 +239,29 @@ class MKPTrainer:
                        utilization=rollout["utilization"].item(), **stats,
                        validation_return=validation_return, validation_improvement_pct=improvement,
                        best_validation_return=best, elapsed_seconds=time.perf_counter() - began)
+            history.append(row)
             with (self.run_dir / "metrics.csv").open("a", newline="", encoding="utf-8") as f:
                 csv.DictWriter(f, fieldnames=self.fields).writerow(row)
-            self.logger.info("M=%d update=%d/%d N=%d reward=%.5f policy=%.5f value=%.5f KL=%.5f val=%s",
+            self.logger.info("M=%d update=%d/%d N=%d reward=%.5f policy=%.5f value=%.5f "
+                             "entropy=%.5f KL=%.5f clip=%.5f grad=%.5f explained_variance=%.5f val=%s",
                              m, update, c.updates, n, row["normalized_return"], stats["policy_loss"],
-                             stats["value_loss"], stats["approx_kl"], validation_return)
+                             stats["value_loss"], stats["entropy"], stats["approx_kl"], stats["clip_fraction"],
+                             stats["grad_norm"], stats["explained_variance"], validation_return)
+            if validation_return is not None:
+                report = convergence_report(history, c)
+                plateau = (report["plateau_start_update"], report["confirmation_update"])
+                if plateau != previous_plateau and (plateau[0] is not None or
+                                                     (previous_plateau and previous_plateau[0] is not None)):
+                    self.logger.info("M=%d CONVERGENCE_CANDIDATE | at_update=%d status=%s "
+                                     "plateau_start_update=%s confirmation_update=%s | provisional; final report supersedes this",
+                                     m, update, report["status"], *plateau)
+                previous_plateau = plateau
             if improved or update % c.checkpoint_every == 0 or update == c.updates:
                 payload = {"checkpoint_version": CHECKPOINT_VERSION, "decoder_version": DECODER_VERSION,
                            "model_config": config_dict(self.model_config), "train_config": config_dict(c),
                            "generator_config": config_dict(self.generator_config), "num_resources": m,
                            "training_data_source": "synthetic_only", "update": update,
+                           "diagnostics_history": history,
                            "best_validation_return": best, "model_state": model.state_dict(),
                            "optimizer_state": optimizer.state_dict(), "numpy_generator_state": rng.bit_generator.state,
                            "torch_rng_state": torch.get_rng_state(),
@@ -246,6 +271,17 @@ class MKPTrainer:
                 if improved:
                     atomic_checkpoint(c.checkpoint_dir / f"mkp_M{m}_best.pt", payload)
         self.logger.info("M=%s complete | best synthetic validation=%.6f", m, best)
+        report = convergence_report(history, c, complete=True)
+        report.update(M=m, run_dir=str(self.run_dir), final_update=c.updates)
+        write_json(self.run_dir / f"convergence_M{m}.json", report)
+        write_json(self.run_dir / f"diagnostics_history_M{m}.json", history)
+        self.logger.info("M=%d CONVERGENCE_FINAL | status=%s plateau_start_update=%s confirmation_update=%s "
+                         "best_update=%s best_validation_return=%.8f observed_through_update=%s | "
+                         "fixed synthetic validation; not a claim about Chu gap convergence",
+                         m, report["status"], report["plateau_start_update"], report["confirmation_update"],
+                         report["best_update"], report["best_validation_return"], report["observed_through_update"])
+        paths = plot_training(history, report, c, self.run_dir / "plots", m)
+        self.logger.info("M=%d TRAINING_PLOTS | %s", m, " | ".join(map(str, paths)))
 
 
 def main(argv=None):

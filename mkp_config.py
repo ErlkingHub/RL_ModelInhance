@@ -27,6 +27,12 @@ class TrainConfig:
     validation_every: int = 25
     validation_instances_per_shape: int = 64
     checkpoint_every: int = 100
+    # Operational performance plateau on fixed synthetic validation (not Chu gap).
+    convergence_min_updates: int = 1000
+    convergence_patience_updates: int = 1000
+    convergence_min_evaluations: int = 20
+    convergence_tolerance_pct: float = 0.05
+    plot_smoothing_updates: int = 100
     seed: int = 20260910
     validation_seed: int = 1729
     device: str = "auto"
@@ -38,7 +44,9 @@ class TrainConfig:
     def __post_init__(self):
         counts = (self.updates, self.batch_size, self.minibatch_size, self.ppo_epochs,
                   self.validation_every, self.validation_instances_per_shape,
-                  self.checkpoint_every, self.cpu_threads)
+                  self.checkpoint_every, self.cpu_threads, self.convergence_min_updates,
+                  self.convergence_patience_updates, self.convergence_min_evaluations,
+                  self.plot_smoothing_updates)
         if any(x < 1 for x in counts):
             raise ValueError("Training counts/intervals must be positive")
         if not self.num_resources or any(x < 1 for x in self.num_resources):
@@ -54,6 +62,10 @@ class TrainConfig:
             raise ValueError("Loss coefficients must be nonnegative")
         if self.max_grad_norm <= 0 or self.target_kl <= 0:
             raise ValueError("Gradient norm and target KL must be positive")
+        if not 0 < self.convergence_tolerance_pct < 100:
+            raise ValueError("convergence_tolerance_pct must lie in (0, 100)")
+        if self.convergence_min_evaluations < 2:
+            raise ValueError("convergence_min_evaluations must be at least 2")
         self.runs_dir, self.checkpoint_dir = Path(self.runs_dir), Path(self.checkpoint_dir)
 
 
