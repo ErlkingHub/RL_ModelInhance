@@ -7,6 +7,8 @@ import argparse
 import csv
 from datetime import datetime
 import logging
+import math
+from pathlib import Path
 import time
 import numpy as np
 import torch
@@ -16,6 +18,7 @@ from mkp_config import (CHECKPOINT_VERSION, DECODER_VERSION, ModelConfig, Genera
 from mkp_data import synthetic_batch
 from mkp_env import MKPEnv, MKPState
 from mkp_Model import MKPModel
+from mkp_ranking import collect_ranking_batch, ranking_objective, ranking_kl
 from mkp_diagnostics import convergence_report, plot_training, prepare_plotting
 from mkp_utils import (atomic_checkpoint, construct_solution, load_checkpoint, resolve_device,
                        seed_everything, write_json)
@@ -88,6 +91,9 @@ class MKPTrainer:
                        "entropy", "approx_kl", "clip_fraction", "grad_norm", "explained_variance",
                        "minibatches", "kl_stopped", "validation_return", "validation_improvement_pct",
                        "best_validation_return", "elapsed_seconds"]
+        self.fields += ["ranking_proposed", "ranking_pairs", "ranking_abs_return_gap",
+                        "ranking_standard_error", "ranking_label_seconds", "ranking_loss",
+                        "ranking_accuracy", "ranking_kl", "ranking_minibatches"]
         with (self.run_dir / "metrics.csv").open("w", newline="", encoding="utf-8") as f:
             csv.DictWriter(f, fieldnames=self.fields).writeheader()
         write_json(self.run_dir / "config.json", {
@@ -95,8 +101,12 @@ class MKPTrainer:
             "generator": config_dict(self.generator_config), "torch": str(torch.__version__),
             "device": str(self.device), "training_data_source": "synthetic_only"})
 
-    def ppo_update(self, model, optimizer, data, rollout):
+    def ppo_update(self, model, optimizer, data, rollout, update=0):
         c = self.config
+        # No parameter update has occurred since collection: this is the frozen
+        # behavior policy. Branches never enter the PPO buffer or critic targets.
+        ranking, ranking_stats = collect_ranking_batch(model, data, rollout, c,
+            seed=c.seed + 1000003 * update + data[2].shape[-1])
         advantages, returns = generalized_advantage(rollout["rewards"], rollout["values"],
             rollout["dones"], rollout["active"], c.gamma, c.gae_lambda)
         times, batches = rollout["active"].nonzero(as_tuple=True)
@@ -110,6 +120,8 @@ class MKPTrainer:
         sums = {k: 0.0 for k in ("policy_loss", "value_loss", "constraint_aux_loss", "entropy",
                                 "approx_kl", "clip_fraction", "grad_norm")}
         minibatches, observations, stopped = 0, 0, False
+        ranking_sums = dict(ranking_loss=0., ranking_accuracy=0.)
+        ranking_updates, max_ranking_kl = 0, 0.
         for _ in range(c.ppo_epochs):
             order = torch.randperm(times.numel(), device=self.device)
             for ids in order.split(c.minibatch_size):
@@ -122,7 +134,11 @@ class MKPTrainer:
                 approximate_kl = ((ratio - 1) - log_ratio).mean()
                 if not torch.isfinite(approximate_kl):
                     raise FloatingPointError("Non-finite PPO probability ratio")
-                if approximate_kl.item() > c.target_kl:
+                full_ranking_kl = ranking_kl(model, ranking).item() if ranking is not None else 0.
+                if not math.isfinite(full_ranking_kl):
+                    raise FloatingPointError("Non-finite ranking KL")
+                max_ranking_kl = max(max_ranking_kl, full_ranking_kl)
+                if max(approximate_kl.item(), full_ranking_kl) > c.target_kl:
                     stopped = True
                     break
                 surrogate = ratio * normalized_adv[ids]
@@ -135,6 +151,10 @@ class MKPTrainer:
                 entropy = policy.normalized_entropy().mean()
                 loss = (policy_loss + c.value_coefficient * value_loss
                         + c.constraint_aux_coefficient * constraint_loss - c.entropy_coefficient * entropy)
+                if ranking is not None:
+                    rank_ids = torch.randperm(ranking.left.numel(), device=self.device)[:c.ranking_minibatch_size]
+                    rank_loss, _, rank_accuracy = ranking_objective(model, ranking.index(rank_ids), c)
+                    loss = loss + c.ranking_coefficient * rank_loss
                 if not torch.isfinite(loss):
                     raise FloatingPointError("Non-finite PPO loss")
                 optimizer.zero_grad(set_to_none=True)
@@ -142,6 +162,10 @@ class MKPTrainer:
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), c.max_grad_norm,
                                                           error_if_nonfinite=True)
                 optimizer.step()
+                if ranking is not None:
+                    ranking_sums["ranking_loss"] += rank_loss.detach().item()
+                    ranking_sums["ranking_accuracy"] += rank_accuracy.item()
+                    ranking_updates += 1
                 metrics = (policy_loss, value_loss, constraint_loss, entropy, approximate_kl,
                            ((ratio - 1).abs() > c.clip_ratio).float().mean(), grad_norm)
                 for key, val in zip(sums, metrics):
@@ -154,6 +178,13 @@ class MKPTrainer:
         explained = (1 - (targets - old_values).var(unbiased=False) / variance).item() if variance > 1e-12 else float("nan")
         result = {k: v / max(1, observations) for k, v in sums.items()}
         result.update(minibatches=minibatches, kl_stopped=int(stopped), explained_variance=explained)
+        if ranking is not None:
+            final_kl = ranking_kl(model, ranking).item()
+            if not math.isfinite(final_kl):
+                raise FloatingPointError("Non-finite final ranking KL")
+            max_ranking_kl = max(max_ranking_kl, final_kl)
+        result.update(ranking_stats, **{k: v / max(1, ranking_updates) for k, v in ranking_sums.items()},
+                      ranking_kl=max_ranking_kl, ranking_minibatches=ranking_updates)
         return result
 
     def train(self, resume=None):
@@ -223,7 +254,7 @@ class MKPTrainer:
             n = int(rng.choice(c.train_num_items))
             data = synthetic_batch(c.batch_size, n, m, self.generator_config, rng, self.device)
             rollout = collect_rollout(model, data)
-            stats = self.ppo_update(model, optimizer, data, rollout)
+            stats = self.ppo_update(model, optimizer, data, rollout, update)
             validation_return, improvement = None, None
             improved = False
             if update == start or update % c.validation_every == 0 or update == c.updates:
@@ -247,6 +278,12 @@ class MKPTrainer:
                              m, update, c.updates, n, row["normalized_return"], stats["policy_loss"],
                              stats["value_loss"], stats["entropy"], stats["approx_kl"], stats["clip_fraction"],
                              stats["grad_norm"], stats["explained_variance"], validation_return)
+            self.logger.info("M=%d update=%d RANKING | accepted=%d/%d loss=%.5f accuracy=%.4f "
+                             "return_gap=%.6f SE=%.6f KL=%.5f label_seconds=%.2f",
+                             m, update, stats.get("ranking_pairs", 0), stats.get("ranking_proposed", 0),
+                             stats.get("ranking_loss", 0.), stats.get("ranking_accuracy", 0.),
+                             stats.get("ranking_abs_return_gap", 0.), stats.get("ranking_standard_error", 0.),
+                             stats.get("ranking_kl", 0.), stats.get("ranking_label_seconds", 0.))
             if validation_return is not None:
                 report = convergence_report(history, c)
                 plateau = (report["plateau_start_update"], report["confirmation_update"])
@@ -286,6 +323,7 @@ class MKPTrainer:
 
 def main(argv=None):
     defaults = TrainConfig()
+    model_defaults = ModelConfig()
     parser = argparse.ArgumentParser(description="Train MKP high-level strategies on synthetic data only")
     parser.add_argument("--resources", type=int, nargs="+", default=defaults.num_resources)
     parser.add_argument("--train-items", type=int, nargs="+", default=defaults.train_num_items)
@@ -295,8 +333,25 @@ def main(argv=None):
     parser.add_argument("--device", default=defaults.device)
     parser.add_argument("--seed", type=int, default=defaults.seed)
     parser.add_argument("--resume", default=None)
+    parser.add_argument("--checkpoint-dir", type=Path, default=defaults.checkpoint_dir)
+    parser.add_argument("--runs-dir", type=Path, default=defaults.runs_dir)
+    parser.add_argument("--ranking-coefficient", type=float, default=defaults.ranking_coefficient)
+    parser.add_argument("--ranking-states", type=int, default=defaults.ranking_states)
+    parser.add_argument("--ranking-pool-size", type=int, default=defaults.ranking_pool_size)
+    parser.add_argument("--ranking-repeats", type=int, default=defaults.ranking_repeats)
+    parser.add_argument("--opportunity-weight-max", type=float, default=model_defaults.opportunity_weight_max)
+    parser.add_argument("--reserve-weight-max", type=float, default=model_defaults.reserve_weight_max)
+    parser.add_argument("--opportunity-tokens", type=int, default=model_defaults.opportunity_tokens)
+    parser.add_argument("--actor-edge-values", action=argparse.BooleanOptionalAction,
+                        default=model_defaults.actor_edge_values)
     args = parser.parse_args(argv)
     config = TrainConfig(num_resources=tuple(args.resources), train_num_items=tuple(args.train_items),
                          updates=args.updates, batch_size=args.batch_size, minibatch_size=args.minibatch_size,
-                         device=args.device, seed=args.seed)
-    MKPTrainer(config).train(args.resume)
+                         device=args.device, seed=args.seed, checkpoint_dir=args.checkpoint_dir,
+                         runs_dir=args.runs_dir, ranking_coefficient=args.ranking_coefficient,
+                         ranking_states=args.ranking_states, ranking_pool_size=args.ranking_pool_size,
+                         ranking_repeats=args.ranking_repeats)
+    model = ModelConfig(opportunity_weight_max=args.opportunity_weight_max,
+                        reserve_weight_max=args.reserve_weight_max, opportunity_tokens=args.opportunity_tokens,
+                        actor_edge_values=args.actor_edge_values)
+    MKPTrainer(config, model).train(args.resume)

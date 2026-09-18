@@ -26,6 +26,14 @@ class MKPState:
 
 
 class MKPEnv:
+    @classmethod
+    def from_state(cls, state):
+        """Independent branch with exact remaining capacity and selected history."""
+        env = cls.__new__(cls)
+        env.state = MKPState(*(x.clone() for x in
+            (state.profits, state.weights, state.capacities, state.remaining, state.selected)))
+        return env
+
     def __init__(self, profits, weights, capacities):
         if profits.ndim != 2 or weights.ndim != 3 or capacities.ndim != 2:
             raise ValueError("Expected P[B,N], R[B,N,M], B[B,M]")

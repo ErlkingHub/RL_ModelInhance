@@ -1,5 +1,6 @@
 """Reproducibility, checkpoint contracts and shared constructive inference."""
 import hashlib
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -57,7 +58,8 @@ def load_checkpoint(path, device, expected_m=None):
     # Checkpoints are local trusted training artifacts; loading still uses restricted unpickling.
     payload = torch.load(path, map_location="cpu", weights_only=True)
     if payload.get("checkpoint_version") != CHECKPOINT_VERSION:
-        raise ValueError("Incompatible checkpoint schema")
+        raise ValueError("Incompatible checkpoint schema: opportunity v3 requires a fresh training run; "
+                         "v1/v2 weights cannot be resumed as the new controller")
     if payload.get("decoder_version") != DECODER_VERSION:
         raise ValueError("Checkpoint's weak decoder differs from this implementation")
     if expected_m is not None and payload["num_resources"] != expected_m:
@@ -78,13 +80,17 @@ def construct_solution(data, model=None, mode="learned_dynamic", stochastic=Fals
         raise ValueError("A model is required for learned inference")
     env = MKPEnv(*data)
     decoder = model.decoder if model is not None else WeakDecoder(model_config or ModelConfig())
+    if mode == "fixed":
+        # The original density baseline has zero opportunity weights: avoid
+        # charging its runtime for pairwise features it never uses.
+        decoder = WeakDecoder(replace(decoder.config, opportunity_weight_max=0, reserve_weight_max=0))
     if model is not None:
         model.eval()
     theta = decoder.fixed_theta(env.state) if mode == "fixed" else None
     if mode == "learned_static":
         theta = model.actor(env.state)[0]
     sequences = []
-    theta_sum = torch.zeros(data[0].shape[0], 5, device=data[0].device)
+    theta_sum = torch.zeros(data[0].shape[0], 7, device=data[0].device)
     theta_count = torch.zeros(data[0].shape[0], device=data[0].device)
     for _ in range(data[0].shape[1]):
         active = env.state.active
@@ -96,7 +102,8 @@ def construct_solution(data, model=None, mode="learned_dynamic", stochastic=Fals
         actions = policy.choose(stochastic)
         stats = torch.stack((theta.profit_exponent, theta.scarcity_exponent,
                              theta.bottleneck_weight, theta.temperature,
-                             theta.resource_prices.std(-1, unbiased=False)), dim=-1)
+                             theta.resource_prices.std(-1, unbiased=False),
+                             theta.opportunity_weight, theta.reserve_weight), dim=-1)
         theta_sum += stats * active[:, None]
         theta_count += active
         sequences.append(actions)

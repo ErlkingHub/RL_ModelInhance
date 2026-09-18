@@ -1,10 +1,11 @@
 """All experiment defaults. Paths are relative to this project, not the shell cwd."""
 from dataclasses import asdict, dataclass, field
+import math
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-CHECKPOINT_VERSION = 1
-DECODER_VERSION = "resource_price_density_v1"
+CHECKPOINT_VERSION = 3
+DECODER_VERSION = "opportunity_density_v3"
 
 @dataclass
 class TrainConfig:
@@ -24,6 +25,18 @@ class TrainConfig:
     constraint_aux_coefficient: float = 0.05
     max_grad_norm: float = 1.0
     target_kl: float = 0.03
+    # Training-only paired continuations under the frozen pre-update policy.
+    ranking_coefficient: float = 0.1
+    ranking_states: int = 16
+    ranking_pool_size: int = 64
+    ranking_candidates: int = 8
+    ranking_repeats: int = 4
+    ranking_minibatch_size: int = 8
+    ranking_min_gap: float = 0.001
+    ranking_se_multiplier: float = 1.0
+    ranking_return_scale: float = 0.02
+    ranking_score_scale: float = 0.2
+    ranking_greedy_weight: float = 0.5
     validation_every: int = 25
     validation_instances_per_shape: int = 64
     checkpoint_every: int = 100
@@ -39,7 +52,7 @@ class TrainConfig:
     deterministic: bool = True
     cpu_threads: int = 4
     runs_dir: Path = field(default_factory=lambda: ROOT / "runs")
-    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints")
+    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / "opportunity_v3")
 
     def __post_init__(self):
         counts = (self.updates, self.batch_size, self.minibatch_size, self.ppo_epochs,
@@ -66,6 +79,17 @@ class TrainConfig:
             raise ValueError("convergence_tolerance_pct must lie in (0, 100)")
         if self.convergence_min_evaluations < 2:
             raise ValueError("convergence_min_evaluations must be at least 2")
+        if min(self.ranking_states, self.ranking_pool_size, self.ranking_minibatch_size) < 1:
+            raise ValueError("Ranking batch sizes must be positive")
+        if self.ranking_pool_size < self.ranking_states or self.ranking_candidates < 2 or self.ranking_repeats < 2:
+            raise ValueError("Ranking needs pool >= states, candidates >= 2 and repeats >= 2")
+        if not (self.ranking_coefficient >= 0 and self.ranking_min_gap >= 0
+                and self.ranking_se_multiplier >= 0 and self.ranking_return_scale > 0
+                and self.ranking_score_scale > 0 and 0 <= self.ranking_greedy_weight <= 1):
+            raise ValueError("Invalid ranking loss settings")
+        if not all(math.isfinite(x) for x in (self.ranking_coefficient, self.ranking_min_gap,
+                self.ranking_se_multiplier, self.ranking_return_scale, self.ranking_score_scale)):
+            raise ValueError("Ranking loss settings must be finite")
         self.runs_dir, self.checkpoint_dir = Path(self.runs_dir), Path(self.checkpoint_dir)
 
 
@@ -84,6 +108,13 @@ class ModelConfig:
     temperature_min: float = 0.05
     temperature_max: float = 1.0
     feature_clip: float = 100.0
+    # Actor-only enhancements; critic retains its original independent encoder.
+    actor_edge_values: bool = True
+    opportunity_tokens: int = 4
+    opportunity_weight_max: float = 4.0
+    reserve_weight_max: float = 4.0
+    opportunity_bandwidth: float = 0.05
+    opportunity_chunk_size: int = 128
     eps: float = 1e-8
 
     def __post_init__(self):
@@ -101,6 +132,14 @@ class ModelConfig:
             raise ValueError("Strategy ranges must be nonnegative")
         if self.eps <= 0 or self.feature_clip <= 0:
             raise ValueError("eps and feature_clip must be positive")
+        if self.opportunity_tokens < 0 or self.opportunity_chunk_size < 1:
+            raise ValueError("Invalid opportunity attention/chunk sizes")
+        if not (self.opportunity_weight_max >= 0 and self.reserve_weight_max >= 0
+                and self.opportunity_bandwidth > 0):
+            raise ValueError("Invalid opportunity score settings")
+        if not all(math.isfinite(x) for x in (self.opportunity_weight_max, self.reserve_weight_max,
+                                             self.opportunity_bandwidth)):
+            raise ValueError("Opportunity score settings must be finite")
 
 
 @dataclass
@@ -127,7 +166,7 @@ class BenchmarkConfig:
     dataset: Path = field(default_factory=lambda: ROOT / "MKP_dataset" / "Benchmarks_Chu.mat")
     num_resources: tuple[int, ...] = (5, 10)
     num_items: tuple[int, ...] = (100, 250, 500)
-    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints")
+    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / "opportunity_v3")
     results_dir: Path = field(default_factory=lambda: ROOT / "results")
     checkpoint_tag: str = "best"
     device: str = "auto"

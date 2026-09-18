@@ -133,6 +133,8 @@ def benchmark(config=None):
         models[m], payload = load_checkpoint(checkpoint, device, m)
         models[m].eval().requires_grad_(False)
         metadata[str(m)] = {"path": str(checkpoint.resolve()), "sha256": file_sha256(checkpoint),
+                            "checkpoint_version": payload["checkpoint_version"],
+                            "decoder_version": payload["decoder_version"],
                             "update": payload["update"], "model_config": payload["model_config"],
                             "train_num_items": payload["train_config"]["train_num_items"],
                             "training_data_source": payload["training_data_source"],
@@ -157,6 +159,7 @@ def benchmark(config=None):
               "solve_seconds", "seconds_per_rollout", "sample_mean_objective", "sample_std_objective",
               "improvement_over_fixed_pct", "improvement_over_static_pct", "profit_exponent_mean",
               "scarcity_exponent_mean", "bottleneck_weight_mean", "temperature_mean", "price_std_mean",
+              "opportunity_weight_mean", "reserve_weight_mean",
               "size_zero_shot", "checkpoint_sha256", "solution_file"]
     rows = []
     with (output / "instances.csv").open("w", newline="", encoding="utf-8-sig") as stream, \
@@ -191,6 +194,7 @@ def benchmark(config=None):
                         sample_mean_objective=float(np.mean(samples)), sample_std_objective=float(np.std(samples)),
                         profit_exponent_mean=stats[0], scarcity_exponent_mean=stats[1],
                         bottleneck_weight_mean=stats[2], temperature_mean=stats[3], price_std_mean=stats[4],
+                        opportunity_weight_mean=stats[5], reserve_weight_mean=stats[6],
                         size_zero_shot=int(instance.n not in metadata[str(instance.m)]["train_num_items"]),
                         checkpoint_sha256=metadata[str(instance.m)]["sha256"], solution_file="solutions.jsonl")
                     instance_rows.append(row)

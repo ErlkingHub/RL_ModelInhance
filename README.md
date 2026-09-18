@@ -4,6 +4,8 @@
 
 目标是在 `MKP_dataset/Benchmarks_Chu.mat` 上研究接近或低于 **0.1% gap** 的解。该目标需要实验验证，代码交付本身不代表达到该精度。默认训练与测试均由使用者运行。
 
+当前为 **opportunity v3**：增强 Actor 对资源竞争的表示，为固定 score 增加选后机会损失，并用同状态关键候选的终局收益进行排序监督。推理仍是低维 θ 控制无参数弱解码器。v1/v2 checkpoint 不能直接续训；新模型需要重新训练，默认写入独立的 `checkpoints/opportunity_v3/`。
+
 ## 运行
 
 在 PowerShell 中进入本项目，依次执行：
@@ -19,7 +21,7 @@
 # 自行运行：只训练一个资源维度
 & 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' train_ConstrainedMKP.py --resources 5 --updates 2000
 # 自行运行：从 last checkpoint 继续，updates 是累计更新次数目标
-& 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' train_ConstrainedMKP.py --resources 5 --resume checkpoints/mkp_M5_last.pt --updates 4000
+& 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' train_ConstrainedMKP.py --resources 5 --resume checkpoints/opportunity_v3/mkp_M5_last.pt --updates 4000
 # 可选：另报 128 条随机轨迹中的最佳解，不替代单轨迹 greedy 结果
 & 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' Benchmark_zeroShot.py --sample-rollouts 128
 ```
@@ -35,6 +37,7 @@
 | `mkp_env.py`              | float64 容量与收益记账，逐步选择，终止与可行候选集合      |
 | `mkp_Model.py`            | 二分图多头 Transformer、高层策略、固定解码器、独立 Critic |
 | `mkp_Trainer.py`          | 完整 episode 采样、GAE、PPO、合成验证、日志、checkpoint   |
+| `mkp_ranking.py`          | 关键候选筛选、固定策略成对续行、收益标签与排序损失       |
 | `train_ConstrainedMKP.py` | 简洁训练入口                                              |
 | `Benchmark_zeroShot.py`   | 冻结推理、独立解校验、CSV 与物品序列                      |
 | `mkp_utils.py`            | 复现设置、checkpoint 合约、共享构造过程                   |
@@ -43,8 +46,8 @@
 - `runs/<时间戳>/train.log`：每次更新的日志。
 - `runs/<时间戳>/metrics.csv`：收益、归一化 return、利用率、PPO 各项损失、归一化 entropy、KL、梯度范数、Critic explained variance、合成验证表现。
 - `runs/<时间戳>/config.json`：配置与运行环境。
-- `checkpoints/mkp_M5_best.pt`、`mkp_M10_best.pt`：按固定合成验证集的 greedy 归一化收益选择。
-- `checkpoints/mkp_M5_last.pt`、`mkp_M10_last.pt`：最近一次保存的模型，包含优化器和 RNG 状态；默认每 100 次更新、产生新 best 及训练结束时保存。
+- `checkpoints/opportunity_v3/mkp_M5_best.pt`、同目录 `mkp_M10_best.pt`：按固定合成验证集的 greedy 归一化收益选择。
+- `checkpoints/opportunity_v3/mkp_M5_last.pt`、同目录 `mkp_M10_last.pt`：最近一次保存的模型，包含优化器和 RNG 状态；默认每 100 次更新、产生新 best 及训练结束时保存。
 - `results/<时间戳>/instances.csv`：逐实例、逐方法报告。
 - `results/<时间戳>/summary.csv`：每种方法按 M/N 分组及总体报告。
 - `results/<时间戳>/solutions.jsonl`：零基索引物品选择顺序，可独立复核。
@@ -54,7 +57,7 @@
 
 ## 收敛诊断与训练曲线
 
-直接按上面的两条命令运行训练和 Benchmark 即可。`TrainConfig.updates=8000` 仍是每个 M 的完整训练预算；诊断不提前停止训练。每个 M 训练结束后自动生成：
+直接按上面的两条命令运行训练和 Benchmark 即可。`TrainConfig.updates=2000` 是每个 M 的默认训练预算；诊断不提前停止训练。每个 M 训练结束后自动生成：
 
 - `runs/<时间戳>/convergence_M5.json`、`convergence_M10.json`：最终收敛判定及阈值。
 - `runs/<时间戳>/plots/training_M5.png`、`training_M10.png`，以及同名 SVG：12 个子图，包括固定验证收益、训练 return、归一化 policy entropy、policy/value/辅助损失、approx KL、clip fraction、梯度范数、explained variance、容量利用率、KL 提前停止频率。浅色为原始数据，深色为最近 100 updates 的均值；验证曲线不平滑。
@@ -101,7 +104,7 @@ python mkp_diagnostics.py runs/<时间戳>
   1. 初始消耗；
   2. 当前消耗；
   3. 当前相对容量的超额程度。
-代码中没有显式构造邻接矩阵，而是用 edge_features[B,N,M,3] 表示边，并在交叉注意力中作为 attention bias 使用。
+代码中没有显式构造邻接矩阵，而是用 edge_features[B,N,M,3] 表示边。在 Actor 的交叉注意力中，边同时进入 attention bias 和 value 消息，资源占用信息可直接参与聚合；Critic 保留原有的独立编码器。
 Transformer 的作用是：
 1. 分别将物品节点和资源节点映射到统一的 embedding 空间；
 2. 通过物品→资源、资源→物品的交叉多头注意力，让两类节点交换信息，并利用边特征体现资源消耗关系；
@@ -113,6 +116,8 @@ Transformer 的作用是：
    - 稀缺性权重 scarcity_exponent
    - 瓶颈惩罚 bottleneck_weight
    - 温度 temperature
+   - 后续可行机会损失权重 opportunity_weight
+   - 后续资源余量损失权重 reserve_weight
 随后，固定的弱解码器使用 θ 对当前可行物品打分并选择物品。因此，Transformer 不直接输出每个物品的动作概率，而是根据全局二分图状态调整解码器的策略参数。
 
 ## 模型如何感知状态与约束
@@ -121,7 +126,9 @@ Transformer 的作用是：
 
 每个模块包含：物品→资源与资源→物品的带边偏置多头交叉注意力、物品间多头自注意力、资源间多头自注意力、前馈网络。默认 8 头、128 维、2 层。节点没有位置编码，支持不同 N/M 的输入；默认每个 M 单独训练，避免未经验证地宣称跨资源维度泛化。
 
-物品自注意力可学习收益与资源占用的竞争关系，资源自注意力可学习瓶颈资源的竞争关系，但**不预先宣称每个注意力头已经学到了某种语义**。全局剩余容量、已选比例和累计收益也进入策略汇聚。已选和不可行物品仍可作为状态背景参与注意力。
+物品自注意力可学习收益与资源占用的竞争关系，资源自注意力可学习瓶颈资源的竞争关系，但**不预先宣称每个注意力头已经学到了某种语义**。Actor 在均值汇聚后增加 4 个可学习查询，通过注意力提取不同的物品/资源竞争摘要，避免只靠均值稀释少量关键节点。全局剩余容量、已选比例和累计收益也进入策略汇聚。已选和不可行物品仍可作为状态背景参与注意力。
+
+资源价格使用 `MLP(resource, global, resource * global)` 后再归一化。原来的线性拼接中，全局项对所有资源相同，会在 softmax 中抵消；现在全局状态能通过非线性交互改变资源之间的相对价格。
 
 另有当前可行性的辅助预测损失，帮助编码器学习约束表示；该预测头的输出不参与物品评分。Critic 使用独立编码器，不向弱解码器提供预测收益。
 
@@ -133,13 +140,15 @@ Transformer 的作用是：
 
 ## 高层策略与固定弱解码器
 
-高层每步只输出 M 个正资源价格及 4 个标量，共 M+4 个数：
+高层每步只输出 M 个正资源价格及 6 个标量，共 M+6 个数，维度不随 N 增长：
 
 - `resource_prices`：均值为 1，避免价格尺度冗余。
 - `profit_exponent`：收益竞争强度 α。
 - `scarcity_exponent`：资源稀缺性强度 β。
 - `bottleneck_weight`：单一瓶颈占用惩罚 κ。
 - `temperature`：随机策略温度 τ；只影响采样概率，在同一步 greedy 排序中不改变 argmax。
+- `opportunity_weight`：选后永久失去的可行收益机会的惩罚强度 λ。
+- `reserve_weight`：选后资源余量下降的平滑惩罚强度 ρ。
 
 设 p_i 为收益、w_ij 为占用、C_j 为初始容量、c_j 为当前剩余容量：
 
@@ -150,12 +159,68 @@ cost_i  = mean_j(price_j * q_ij * s_j ** beta)
 score_i = alpha * log(max(p_i / mean(p), eps))
           - log(cost_i)
           - kappa * max_j(w_ij / max(c_j, eps))
+          - opportunity_weight * blocked_mass_i
+          - reserve_weight * margin_loss_i
 pi_i    = softmax(score_i / temperature)，只在可行候选集合中归一化
 ```
 
-零总资源消耗的物品用 eps 成本处理；数值实现使用 log-sum-exp。默认固定对照为 price=1、α=1、β=1、κ=0.1、τ=0.2。默认网络的高层头初始化在该策略附近，避免把随机劣质起点误当作弱基线。
+零总资源消耗的物品用 eps 成本处理；数值实现使用 log-sum-exp。默认固定对照为 price=1、α=1、β=1、κ=0.1、τ=0.2、λ=ρ=0，保留原始密度基线。网络初始化为同样的密度参数，并令 λ=ρ=0.1。
 
-弱解码器没有可训练参数、物品指针网络、局部搜索、修复、beam search 或优化求解器。每步评分的开销为 O(KM)，K 为可行物品数；整体模型的物品自注意力仍有 O(N²) 开销，不能把弱解码器的速度等同于完整模型推理速度。
+弱解码器没有可训练参数、物品指针网络、局部搜索、修复、beam search 或优化求解器。原始密度评分为 O(KM)，新增机会项为 O(KNM)，K 为可行物品数；候选按默认 128 个分块，额外峰值张量为 O(128NM)。`fixed` 对照会跳过未使用的机会项计算。机会项增加了实际推理成本；不能把无参数等同于没有计算开销。
+
+### 机会损失如何区分相似物品
+
+设 F 为当前可行集合，Z 为 F 中所有物品的总收益。对候选 i 和其余可行物品 k，计算：
+
+```text
+d_k    = min_j((c_j - w_kj) / max(c_j, eps))
+d_ik   = min_j((c_j - w_ij - w_kj) / max(c_j, eps))
+blocked_mass_i = sum_{k in F, k != i} p_k * 1[存在 j: c_j - w_ij - w_kj < 0] / Z
+margin_loss_i  = sum_{k in F, k != i} p_k * (sigmoid(d_k / h) - sigmoid(d_ik / h)) / Z
+h = opportunity_bandwidth = 0.05
+```
+
+两项都排除 i 自身以及当前已选/不可行物品。容量边界用 float64 判断；平滑项可以在物品尚未不可行时区分接近临界容量的选择。λ、ρ 由全局状态产生，其他算术固定。
+
+微型合约样例：容量 `(10,10)`，A 的利润/占用为 `10.05/(5.2,5.0)`，B 为 `10/(5.0,5.2)`，C 为 `5/(5.0,1.0)`。A、B 总耗用相同，A 的密度略高，但 A 会同时挤掉 B、C；B 之后仍可放 C。测试验证机会项能把选择从 A 翻到 B，强制续行的总收益分别为 10.05 和 15。**这是可控样例上的表达能力检查，不是训练收益或 Chu gap 结果。**
+
+这些机会项只描述剩余候选集合和资源余量，不能把各物品的可行收益之和解释为可同时获得的终局收益。真正的长程方向来自下面的完整续行监督；有限维 θ 仍不保证所有状态都能表达最佳选择。
+
+### 同状态的长程排序训练
+
+每次 PPO 更新之前，从本轮合成 rollout 抽取最多 64 个状态。以实际 greedy 候选为锚，在最高分的 8 个可行候选中，按利润差、逐资源占用差和原始 score 差选择相近对手。最多保留 16 个状态：约 3/4 优先取难区分的状态，其余随机选取，限制只盯着最小分差带来的偏置。
+
+对每个状态复制两个分支，分别先选 i、j；后续都使用**本次更新前、参数固定的策略**构造到终点。每对执行 1 组 greedy 续行和 4 组随机续行；随机分支在相同步骤对相同原始物品共享 Gumbel 噪声。标签为归一化终局收益差 Δ，默认各占 50% greedy 和随机均值。过滤 `|Δ| <= max(0.001, SE)` 的小差异/噪声样本，也过滤 greedy 与随机均值明确冲突的方向。该标签是当前策略下的续行估计，不是最优 Q 值或 oracle。
+
+```text
+target = sigmoid(delta / ranking_return_scale)
+margin = (score_i - score_j) / ranking_score_scale
+ranking_loss = BCEWithLogits(margin, target)
+total_loss = 原 PPO/Value/可行性/Entropy 损失 + 0.1 * ranking_loss
+```
+
+排序使用温度缩放**之前**的 score，模型不能只调低采样温度来满足排序监督。标签及续行均无梯度；梯度由固定 score 经 θ 回到 Actor，不进入 Critic。反事实分支不进入 PPO buffer，不改变 GAE/Value 的目标。每个 PPO minibatch 另外计算整个标签状态集合的全候选 KL，超过 `target_kl` 即停止后续更新，避免只检查已采样动作而遗漏其他候选的概率漂移。标签使用独立 RNG，不消耗主 rollout 随机流。
+
+`metrics.csv` / `train.log` 增加标签提议/接受数、平均终局收益差、标准误、标签耗时、排序损失、排序方向正确率和全候选 KL。`ranking_accuracy` 是当轮被接受训练对上的方向正确率；没有接受对时记 0，应结合 `ranking_pairs` 阅读，不能当作独立验证精度。Benchmark 新增 λ、ρ 均值，checkpoint/manifest 保存 v3 版本与完整模型配置。推理不执行反事实续行。
+
+### 运行与独立消融
+
+默认命令已开启全部改动。下面的开关用于分别检验贡献，建议每组使用相同种子、训练预算及独立 checkpoint 目录，最终比较同一批实例的配对收益/gap：
+
+| 关闭的部分 | 训练参数 |
+| --- | --- |
+| 长程排序监督 | `--ranking-coefficient 0` |
+| 选后机会评分 | `--opportunity-weight-max 0 --reserve-weight-max 0` |
+| Actor 边 Value | `--no-actor-edge-values` |
+| 竞争摘要查询 | `--opportunity-tokens 0` |
+
+可以组合开关做因子消融；非线性资源价格头在这些组中保持一致。关闭所有开关不等于恢复 v1 网络结构。完整续行标签会增加训练时间，可用 `--ranking-states 8 --ranking-repeats 2` 降低标注预算；样本量和方差也随之改变，应记录配置。
+
+```powershell
+# 自行运行：仅关闭长程排序，保留网络与新评分
+python train_ConstrainedMKP.py --ranking-coefficient 0 --checkpoint-dir checkpoints/ablation_no_ranking
+python Benchmark_zeroShot.py --checkpoint-dir checkpoints/ablation_no_ranking
+```
 
 ## 强化学习与零样本边界
 
@@ -192,7 +257,7 @@ pi_i    = softmax(score_i / temperature)，只在可行候选集合中归一化
 
 ## 交付验证
 
-`tests/test_contracts.py` 只检查小张量上的候选概率、固定公式、约束拒绝、终止/GAE、排列等变性、高层梯度、checkpoint 往返及独立解校验；不含优化器更新、训练 episode 或 Chu 推理。训练收敛性、实际 GPU 内存/速度和最终 gap 需在正式实验中验证。
+测试检查小张量上的候选概率、固定公式、约束拒绝、终止/GAE、排列等变性、高层梯度、checkpoint 往返及独立解校验。`tests/test_opportunity_ranking.py` 额外检查关键选择翻转、微型实例的固定策略终局收益、共享随机数、排序梯度、温度不变性和全候选 KL；PPO 接线测试以 mock 替代优化器 step。未执行真实参数更新、完整训练或 Chu 评估。训练收敛性、实际 GPU 内存/速度和最终 gap 需在正式实验中验证。
 
 
 ## 全流程如下：
@@ -215,9 +280,9 @@ pi_i    = softmax(score_i / temperature)，只在可行候选集合中归一化
    - 物品节点内部 self-attention
    - 资源节点内部 self-attention
    - 残差连接、LayerNorm 和前馈网络
-   边特征被转换为 attention bias，影响物品—资源之间的信息交互。
+   Actor 将边特征用于 attention bias 与 value 消息，影响物品—资源之间的信息交互。
 5. 全局状态聚合
-   对物品节点和资源节点分别平均池化，并与全局特征拼接，得到全局状态表示 pooled。
+   对物品节点和资源节点分别平均池化，并与全局特征拼接，再通过可学习查询提取竞争摘要，得到 pooled。
 6. 高层策略生成
    pooled 输入高层策略头，输出策略参数 θ：
    - 资源价格
@@ -225,6 +290,7 @@ pi_i    = softmax(score_i / temperature)，只在可行候选集合中归一化
    - 稀缺性权重
    - 瓶颈惩罚权重
    - 温度参数
+   - 选后机会损失和资源余量损失权重
 7. 弱解码器评分
    固定弱解码器使用 θ 对当前可行物品评分。Transformer 不直接生成物品 logits，只调节评分公式中的策略参数。
 8. 选择动作
@@ -249,4 +315,4 @@ MKP实例
 → 可行物品动作
 → 状态更新与奖励
 → 循环
-训练时，PPO 根据实际物品动作的概率更新 Transformer 和高层策略；Critic 使用独立的二分图编码器估计状态价值。
+训练时，PPO 根据实际物品动作的概率更新 Transformer 和高层策略，并增加同状态关键候选的终局收益排序监督；Critic 使用独立的二分图编码器估计状态价值。

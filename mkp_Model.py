@@ -46,7 +46,7 @@ def state_features(state: MKPState, config: ModelConfig):
 
 class EdgeCrossAttention(nn.Module):
     """Multihead cross-attention with resource-consumption edge biases, no masks."""
-    def __init__(self, config):
+    def __init__(self, config, edge_values=False):
         super().__init__()
         d = config.embed_dim
         self.heads = config.num_heads
@@ -54,6 +54,7 @@ class EdgeCrossAttention(nn.Module):
         self.q, self.k, self.v = (nn.Linear(d, d) for _ in range(3))
         self.edge_bias = nn.Sequential(nn.Linear(3, d // 2), nn.GELU(), nn.Linear(d // 2, self.heads))
         self.output = nn.Linear(d, d)
+        self.edge_value = nn.Linear(3, d, bias=False) if edge_values else None
 
     def forward(self, queries, context, edges):
         b, nq, d = queries.shape
@@ -63,15 +64,20 @@ class EdgeCrossAttention(nn.Module):
         v = self.v(context).view(b, nk, self.heads, self.head_dim).transpose(1, 2)
         bias = self.edge_bias(edges).permute(0, 3, 1, 2)
         attention = (q @ k.transpose(-1, -2) / math.sqrt(self.head_dim) + bias).softmax(-1)
-        result = (attention @ v).transpose(1, 2).reshape(b, nq, d)
+        result = attention @ v
+        if self.edge_value is not None:
+            edge_v = self.edge_value(edges).view(b, nq, nk, self.heads, self.head_dim)
+            result = result + torch.einsum("bhij,bijhd->bhid", attention, edge_v)
+        result = result.transpose(1, 2).reshape(b, nq, d)
         return self.output(result)
 
 
 class BipartiteBlock(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, strategy=False):
         super().__init__()
         d, h = config.embed_dim, config.num_heads
-        self.item_cross, self.resource_cross = EdgeCrossAttention(config), EdgeCrossAttention(config)
+        self.item_cross = EdgeCrossAttention(config, strategy and config.actor_edge_values)
+        self.resource_cross = EdgeCrossAttention(config, strategy and config.actor_edge_values)
         self.item_self = nn.MultiheadAttention(d, h, dropout=0.0, batch_first=True)
         self.resource_self = nn.MultiheadAttention(d, h, dropout=0.0, batch_first=True)
         self.item_norms = nn.ModuleList([nn.LayerNorm(d) for _ in range(3)])
@@ -94,14 +100,20 @@ class BipartiteBlock(nn.Module):
 
 
 class BipartiteEncoder(nn.Module):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, strategy=False):
         super().__init__()
         self.config = config
         d = config.embed_dim
         self.item_input, self.resource_input = nn.Linear(8, d), nn.Linear(6, d)
-        self.blocks = nn.ModuleList([BipartiteBlock(config) for _ in range(config.num_layers)])
+        self.blocks = nn.ModuleList([BipartiteBlock(config, strategy) for _ in range(config.num_layers)])
         self.item_norm, self.resource_norm = nn.LayerNorm(d), nn.LayerNorm(d)
         self.pool = nn.Sequential(nn.Linear(2 * d + 6, d), nn.GELU(), nn.LayerNorm(d))
+        self.queries = None
+        if strategy and config.opportunity_tokens:
+            self.queries = nn.Parameter(torch.randn(config.opportunity_tokens, d) / math.sqrt(d))
+            self.opportunity_attention = nn.MultiheadAttention(d, config.num_heads, batch_first=True)
+            self.opportunity_pool = nn.Sequential(
+                nn.Linear((config.opportunity_tokens + 1) * d, d), nn.GELU(), nn.LayerNorm(d))
 
     def forward(self, state):
         item_f, resource_f, edges, global_f = state_features(state, self.config)
@@ -110,6 +122,12 @@ class BipartiteEncoder(nn.Module):
             items, resources = block(items, resources, edges)
         items, resources = self.item_norm(items), self.resource_norm(resources)
         pooled = self.pool(torch.cat((items.mean(1), resources.mean(1), global_f), dim=-1))
+        if self.queries is not None:
+            # Learned summaries attend to all nodes, without emitting item logits.
+            context = torch.cat((items, resources), dim=1)
+            queries = self.queries[None].expand(items.shape[0], -1, -1) + pooled[:, None]
+            summary = self.opportunity_attention(queries, context, context, need_weights=False)[0]
+            pooled = self.opportunity_pool(torch.cat((pooled, summary.flatten(1)), -1))
         return items, resources, pooled
 
 
@@ -120,28 +138,33 @@ class StrategyTheta:
     scarcity_exponent: torch.Tensor
     bottleneck_weight: torch.Tensor
     temperature: torch.Tensor
+    opportunity_weight: torch.Tensor  # [B], penalty for lost feasible profit mass
+    reserve_weight: torch.Tensor      # [B], smooth loss of future capacity margins
 
     def detach(self):
         return StrategyTheta(*(x.detach() for x in (self.resource_prices, self.profit_exponent,
-                             self.scarcity_exponent, self.bottleneck_weight, self.temperature)))
+                             self.scarcity_exponent, self.bottleneck_weight, self.temperature,
+                             self.opportunity_weight, self.reserve_weight)))
 
 
 class HighLevelController(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
-        self.encoder = BipartiteEncoder(config)
-        self.price_head = nn.Linear(2 * config.embed_dim, 1)
-        self.strategy_head = nn.Linear(config.embed_dim, 4)
+        self.encoder = BipartiteEncoder(config, strategy=True)
+        # A linear concatenation makes the shared pooled term cancel in softmax.
+        self.price_context = nn.Sequential(nn.Linear(3 * config.embed_dim, config.embed_dim), nn.GELU())
+        self.price_head = nn.Linear(config.embed_dim, 1, bias=False)
+        self.strategy_head = nn.Linear(config.embed_dim, 6)
         # Auxiliary state supervision only. Its item outputs never enter decoder scores.
         self.feasibility_head = nn.Linear(config.embed_dim, 1)
         nn.init.zeros_(self.price_head.weight)
-        nn.init.zeros_(self.price_head.bias)
         nn.init.zeros_(self.strategy_head.weight)
-        defaults = (1.0, 1.0, 0.1, 0.2)
+        defaults = (1.0, 1.0, 0.1, 0.2, 0.1, 0.1)
         bounds = ((config.profit_exponent_min, config.profit_exponent_max),
                   (0, config.scarcity_exponent_max), (0, config.bottleneck_weight_max),
-                  (config.temperature_min, config.temperature_max))
+                  (config.temperature_min, config.temperature_max),
+                  (0, config.opportunity_weight_max), (0, config.reserve_weight_max))
         with torch.no_grad():
             for j, (v, (lo, hi)) in enumerate(zip(defaults, bounds)):
                 fraction = min(0.999, max(0.001, (v - lo) / (hi - lo))) if hi > lo else 0.5
@@ -151,14 +174,17 @@ class HighLevelController(nn.Module):
         items, resources, pooled = self.encoder(state)
         c = self.config
         m = resources.shape[1]
-        price_logits = self.price_head(torch.cat((resources, pooled[:, None, :].expand_as(resources)), -1)).squeeze(-1)
+        global_context = pooled[:, None, :].expand_as(resources)
+        price_logits = self.price_head(self.price_context(torch.cat(
+            (resources, global_context, resources * global_context), -1))).squeeze(-1)
         prices = c.price_floor + (1 - c.price_floor) * m * price_logits.softmax(-1)
         controls = self.strategy_head(pooled).sigmoid()
         theta = StrategyTheta(
             prices,
             c.profit_exponent_min + (c.profit_exponent_max - c.profit_exponent_min) * controls[:, 0],
             c.scarcity_exponent_max * controls[:, 1], c.bottleneck_weight_max * controls[:, 2],
-            c.temperature_min + (c.temperature_max - c.temperature_min) * controls[:, 3])
+            c.temperature_min + (c.temperature_max - c.temperature_min) * controls[:, 3],
+            c.opportunity_weight_max * controls[:, 4], c.reserve_weight_max * controls[:, 5])
         return theta, self.feasibility_head(items).squeeze(-1)
 
 
@@ -213,6 +239,8 @@ class WeakDecoder:
     cost_i = mean_j(price_j * q_ij * s_j ** beta)
     score_i = alpha * log(p_i / mean(p)) - log(cost_i)
               - kappa * max_j(w_ij / max(c_j, eps))
+              - opportunity_weight * blocked_profit_mass_i
+              - reserve_weight * smooth_margin_loss_i
     pi(i|s) = softmax(score_i / temperature) over feasible candidates.
     """
     def __init__(self, config: ModelConfig):
@@ -223,7 +251,40 @@ class WeakDecoder:
         device = state.profits.device
         return StrategyTheta(torch.ones(b, m, device=device), torch.ones(b, device=device),
                              torch.ones(b, device=device), torch.full((b,), 0.1, device=device),
-                             torch.full((b,), 0.2, device=device))
+                             torch.full((b,), 0.2, device=device),
+                             torch.zeros(b, device=device), torch.zeros(b, device=device))
+
+    @torch.no_grad()
+    def opportunity_features(self, state, owners, items):
+        """Transparent pairwise capacity arithmetic, not a rollout or learned Q head.
+
+        Exclude the chosen item and already infeasible items. Normalize both losses
+        by the same pre-decision feasible profit mass. Chunk candidate x other-item
+        tensors to bound peak storage; comparisons retain float64 accounting.
+        """
+        feasible = state.feasible
+        mass = state.profits * feasible
+        total = mass.sum(-1).clamp_min(self.config.eps)
+        baseline = ((state.remaining[:, None] - state.weights)
+                    / state.remaining[:, None].clamp_min(self.config.eps)).amin(-1)
+        baseline = torch.sigmoid(baseline.float() / self.config.opportunity_bandwidth)
+        blocked, reserve = [], []
+        item_ids = torch.arange(state.profits.shape[1], device=items.device)
+        for row, col in zip(owners.split(self.config.opportunity_chunk_size),
+                            items.split(self.config.opportunity_chunk_size)):
+            after = state.remaining[row] - state.weights[row, col]
+            margin = after[:, None] - state.weights[row]
+            lost = (margin < 0).any(-1)
+            soft = torch.sigmoid((margin / state.remaining[row, None].clamp_min(self.config.eps))
+                                 .amin(-1).float() / self.config.opportunity_bandwidth)
+            other_mass = mass[row] * (item_ids[None] != col[:, None])
+            blocked.append(((lost * other_mass).sum(-1) / total[row]).float())
+            reserve.append((((baseline[row] - soft).clamp_min(0) * other_mass).sum(-1)
+                            / total[row]).float())
+        if not blocked:
+            empty = state.profits.new_empty(0, dtype=torch.float32)
+            return empty, empty
+        return torch.cat(blocked), torch.cat(reserve)
 
     def __call__(self, state, theta):
         owners, items = state.feasible.nonzero(as_tuple=True)
@@ -248,6 +309,10 @@ class WeakDecoder:
         bottleneck = (candidate_w / rem[owners].clamp_min(eps)).amax(-1)
         scores = theta.profit_exponent[owners] * profit.clamp_min(eps).log() - log_cost
         scores = scores - theta.bottleneck_weight[owners] * bottleneck
+        if self.config.opportunity_weight_max or self.config.reserve_weight_max:
+            blocked, reserve = self.opportunity_features(state, owners, items)
+            scores = (scores - theta.opportunity_weight[owners] * blocked
+                      - theta.reserve_weight[owners] * reserve)
         return CandidatePolicy(owners, items, scores / theta.temperature[owners], p.shape[0])
 
 
