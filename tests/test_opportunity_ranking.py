@@ -255,7 +255,7 @@ class OpportunityTests(unittest.TestCase):
     def test_schema_rejects_old_checkpoint_before_loading(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "old.pt"
-            for version in (1, 2):
+            for version in (1, 2, 3):
                 atomic_checkpoint(path, dict(checkpoint_version=version))
                 with self.assertRaisesRegex(ValueError, "fresh training"):
                     load_checkpoint(path, "cpu")

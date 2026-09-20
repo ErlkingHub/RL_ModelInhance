@@ -13,7 +13,7 @@ import time
 import numpy as np
 import torch
 from torch.nn import functional as F
-from mkp_config import (CHECKPOINT_VERSION, DECODER_VERSION, ModelConfig, GeneratorConfig,
+from mkp_config import (CHECKPOINT_VERSION, CONTROLLER_VERSION, DECODER_VERSION, ModelConfig, GeneratorConfig,
                         TrainConfig, config_dict)
 from mkp_data import synthetic_batch
 from mkp_env import MKPEnv, MKPState
@@ -295,6 +295,7 @@ class MKPTrainer:
                 previous_plateau = plateau
             if improved or update % c.checkpoint_every == 0 or update == c.updates:
                 payload = {"checkpoint_version": CHECKPOINT_VERSION, "decoder_version": DECODER_VERSION,
+                           "controller_version": CONTROLLER_VERSION,
                            "model_config": config_dict(self.model_config), "train_config": config_dict(c),
                            "generator_config": config_dict(self.generator_config), "num_resources": m,
                            "training_data_source": "synthetic_only", "update": update,
@@ -344,6 +345,13 @@ def main(argv=None):
     parser.add_argument("--opportunity-tokens", type=int, default=model_defaults.opportunity_tokens)
     parser.add_argument("--actor-edge-values", action=argparse.BooleanOptionalAction,
                         default=model_defaults.actor_edge_values)
+    for field in ("actor_postdecision_features", "actor_pair_attention", "actor_contrast_pooling",
+                  "actor_feasible_attention"):
+        parser.add_argument("--" + field.replace("_", "-"), action=argparse.BooleanOptionalAction,
+                            default=getattr(model_defaults, field))
+    parser.add_argument("--actor-relation-chunk-size", type=int, default=model_defaults.actor_relation_chunk_size)
+    parser.add_argument("--actor-relation-bandwidth", type=float, default=model_defaults.actor_relation_bandwidth)
+    parser.add_argument("--actor-similarity-bandwidth", type=float, default=model_defaults.actor_similarity_bandwidth)
     args = parser.parse_args(argv)
     config = TrainConfig(num_resources=tuple(args.resources), train_num_items=tuple(args.train_items),
                          updates=args.updates, batch_size=args.batch_size, minibatch_size=args.minibatch_size,
@@ -353,5 +361,12 @@ def main(argv=None):
                          ranking_repeats=args.ranking_repeats)
     model = ModelConfig(opportunity_weight_max=args.opportunity_weight_max,
                         reserve_weight_max=args.reserve_weight_max, opportunity_tokens=args.opportunity_tokens,
-                        actor_edge_values=args.actor_edge_values)
+                        actor_edge_values=args.actor_edge_values,
+                        actor_postdecision_features=args.actor_postdecision_features,
+                        actor_pair_attention=args.actor_pair_attention,
+                        actor_contrast_pooling=args.actor_contrast_pooling,
+                        actor_feasible_attention=args.actor_feasible_attention,
+                        actor_relation_chunk_size=args.actor_relation_chunk_size,
+                        actor_relation_bandwidth=args.actor_relation_bandwidth,
+                        actor_similarity_bandwidth=args.actor_similarity_bandwidth)
     MKPTrainer(config, model).train(args.resume)

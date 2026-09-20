@@ -13,7 +13,7 @@ class MKPState:
 
     @property
     def feasible(self):
-        # This is the physical constraint set. Never used as an attention/logit mask.
+        # Physical action set; also available to Actor attention for candidate aggregation.
         return (~self.selected) & (self.weights <= self.remaining[:, None, :]).all(dim=-1)
 
     @property

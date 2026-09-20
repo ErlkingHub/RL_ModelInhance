@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from Benchmark_zeroShot import verify_solution
-from mkp_config import CHECKPOINT_VERSION, DECODER_VERSION, GeneratorConfig, ModelConfig, config_dict
+from mkp_config import CHECKPOINT_VERSION, CONTROLLER_VERSION, DECODER_VERSION, GeneratorConfig, ModelConfig, config_dict
 from mkp_data import MKPInstance, synthetic_batch
 from mkp_env import MKPEnv, MKPState
 from mkp_Model import CandidatePolicy, MKPModel, StrategyTheta, WeakDecoder
@@ -135,6 +135,7 @@ class Contracts(unittest.TestCase):
     def test_checkpoint_contract(self):
         model = MKPModel(self.config)
         payload = dict(checkpoint_version=CHECKPOINT_VERSION, decoder_version=DECODER_VERSION,
+                       controller_version=CONTROLLER_VERSION,
                        training_data_source="synthetic_only", num_resources=2,
                        model_config=config_dict(self.config), model_state=model.state_dict())
         with tempfile.TemporaryDirectory() as directory:

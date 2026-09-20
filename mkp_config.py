@@ -4,7 +4,8 @@ import math
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-CHECKPOINT_VERSION = 3
+CHECKPOINT_VERSION = 4
+CONTROLLER_VERSION = "candidate_relations_v4"
 DECODER_VERSION = "opportunity_density_v3"
 
 @dataclass
@@ -52,7 +53,7 @@ class TrainConfig:
     deterministic: bool = True
     cpu_threads: int = 4
     runs_dir: Path = field(default_factory=lambda: ROOT / "runs")
-    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / "opportunity_v3")
+    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / "controller_v4")
 
     def __post_init__(self):
         counts = (self.updates, self.batch_size, self.minibatch_size, self.ppo_epochs,
@@ -110,6 +111,13 @@ class ModelConfig:
     feature_clip: float = 100.0
     # Actor-only enhancements; critic retains its original independent encoder.
     actor_edge_values: bool = True
+    actor_postdecision_features: bool = True
+    actor_pair_attention: bool = True
+    actor_contrast_pooling: bool = True
+    actor_feasible_attention: bool = True
+    actor_relation_chunk_size: int = 32
+    actor_relation_bandwidth: float = 0.05
+    actor_similarity_bandwidth: float = 0.1
     opportunity_tokens: int = 4
     opportunity_weight_max: float = 4.0
     reserve_weight_max: float = 4.0
@@ -134,6 +142,11 @@ class ModelConfig:
             raise ValueError("eps and feature_clip must be positive")
         if self.opportunity_tokens < 0 or self.opportunity_chunk_size < 1:
             raise ValueError("Invalid opportunity attention/chunk sizes")
+        if self.actor_relation_chunk_size < 1:
+            raise ValueError("actor_relation_chunk_size must be positive")
+        if not all(math.isfinite(x) and x > 0 for x in
+                   (self.actor_relation_bandwidth, self.actor_similarity_bandwidth)):
+            raise ValueError("Actor relation bandwidths must be finite and positive")
         if not (self.opportunity_weight_max >= 0 and self.reserve_weight_max >= 0
                 and self.opportunity_bandwidth > 0):
             raise ValueError("Invalid opportunity score settings")
@@ -166,7 +179,7 @@ class BenchmarkConfig:
     dataset: Path = field(default_factory=lambda: ROOT / "MKP_dataset" / "Benchmarks_Chu.mat")
     num_resources: tuple[int, ...] = (5, 10)
     num_items: tuple[int, ...] = (100, 250, 500)
-    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / "opportunity_v3")
+    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / "controller_v4")
     results_dir: Path = field(default_factory=lambda: ROOT / "results")
     checkpoint_tag: str = "best"
     device: str = "auto"

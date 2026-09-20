@@ -4,7 +4,42 @@
 
 目标是在 `MKP_dataset/Benchmarks_Chu.mat` 上研究接近或低于 **0.1% gap** 的解。该目标需要实验验证，代码交付本身不代表达到该精度。默认训练与测试均由使用者运行。
 
-当前为 **opportunity v3**：增强 Actor 对资源竞争的表示，为固定 score 增加选后机会损失，并用同状态关键候选的终局收益进行排序监督。推理仍是低维 θ 控制无参数弱解码器。v1/v2 checkpoint 不能直接续训；新模型需要重新训练，默认写入独立的 `checkpoints/opportunity_v3/`。
+当前为 **controller v4**：针对 profit、资源消耗相近，但终局收益不同的关键候选，增强高层控制器的选后感知、关系注意力和差异聚合。**本轮保持 `StrategyTheta`、θ 范围、`WeakDecoder` 评分公式及原有终局排序监督不变**，解码器版本仍是 `opportunity_density_v3`。checkpoint schema 升为 4，控制器标识为 `candidate_relations_v4`；v1/v2/v3 checkpoint 不能续训或直接评估，需要重新训练，默认产物存入独立的 `checkpoints/controller_v4/`。
+
+## 本轮核心修改：让 θ 看见关键候选的差别
+
+动机来自用户提供的 oracle_ceiling 实验：曾找到能通过合法 θ 选择更优物品的轨迹。因此本轮优先改善控制器如何感知状态、如何把差异传到 θ；没有在本次交付中重新运行或独立验证 oracle 实验。原网络已有边 Value 和竞争查询，但没有显式读取每个候选的选后兼容关系，且已选、不可行物品仍参与注意力和均值池化。
+
+| 改动 | 网络获得的信息 | 代码位置 |
+| --- | --- | --- |
+| 选后物品特征 | 选择 i 后阻断的可行收益质量、平滑兼容收益质量、其他物品仍可行的比例、平滑余量损失，共 4 维 | `mkp_attention.py:candidate_relations`，`mkp_Model.py:BipartiteEncoder` |
+| 选后资源边特征 | 每个资源分别造成的阻断收益质量和余量损失，共 2 维；保留应调整哪个资源价格的信息 | `candidate_relations`，`BipartiteBlock` 的双向交叉注意力 |
+| 物品关系注意力 | 利润差、负载差、共同装入余量、是否冲突等关系同时进入 attention bias 和 Value；即使节点 Value 接近，也能传递不同消息 | `mkp_attention.py:PairRelationAttention` |
+| 相似候选差异聚合 | 将候选与相近物品比较，保留有方向的 embedding 差和选后特征差；通过差异强度及可学习查询汇聚关键候选 | `mkp_attention.py:CriticalContrastPool` |
+| 可行候选聚合 | Actor 的物品消息、物品均值及竞争查询仅聚合当前可行物品；全局历史摘要仍保留 | `mkp_Model.py:EdgeCrossAttention/BipartiteEncoder` |
+
+对当前可行且不同的 i、j，先用 float64 计算 `r_ijm = (remaining_m - w_im) - w_jm`。任一维 `r_ijm < 0` 表示选择 i 后 j 无法再装入。所有收益质量都除以选择前的可行总收益；排除自身、已选及当前不可行物品。资源边上的阻断归因逐资源计算，同一个物品可以在多个资源上冲突，因此各资源归因不应相加解释为总阻断收益。
+
+物品间 7 维关系为：`(p_i-p_j)/max(p_i+p_j,eps)`、平均 `|w_i-w_j|/remaining`、最小相对共同余量、是否阻断、平滑兼容度、相对选择前的平滑余量损失、j 的可行收益质量。实现对零分母作下界保护，对极端相对负载作截断；容量是否超限始终使用原始 float64 余量比较。差异池化按利润差与负载差为其他候选分配相似性权重，不依赖物品序号或硬 top-k；再用候选自身与相似候选的差异构成非线性消息，避免正负差直接求平均后抵消。
+
+例如 A=`(p=10.05,w=[5.2,5])`、B=`(p=10,w=[5,5.2])`、C=`(p=5,w=[5,1])`，剩余容量为 `[10,10]`：A、B 即时属性相近，A 会阻断 C，B 保留 C。新 Actor 可以直接看到这一区别及其资源归因，再通过 θ 改变既有公式的相对评分。**这些是当前状态的静态兼容信息，不是终局收益预测，也不能保证识别所有多步组合效应。** 终局方向仍由 PPO 和已有的冻结策略续行排序损失学习；排序标签仍是当前策略下的收益估计。
+
+数据流：`当前状态 → 选后关系特征 → Actor 二分图与物品关系注意力 → 相似候选差异汇聚 → 原有 θ → 原有弱解码器`。新增注意力权重仅用于内部表示，不输出动作分数、不预测物品 Q 值、不在推理时试走轨迹。Critic 的独立编码器、PPO/GAE、奖励及 ranking 标签构造保持原样。原有 θ 输出头的零权重初始化也保留：策略/排序分支在初始化时首先更新 θ 输出头，之后梯度传入上游表示；可行性辅助分支仍可从首步向 Actor 编码器传递梯度。梯度测试使用非零 θ 头权重验证排序通路，没有执行优化器更新。
+
+### 本轮消融与计算开销
+
+四个开关默认开启，可分别关闭并组合做因子消融，使用相同种子、训练预算、独立 checkpoint 目录，最终比较配对收益/gap：
+
+| 消融 | 命令参数 |
+| --- | --- |
+| 不向物品输入/资源边注入选后特征 | `--no-actor-postdecision-features` |
+| 恢复普通物品自注意力 | `--no-actor-pair-attention` |
+| 关闭相似候选差异池化 | `--no-actor-contrast-pooling` |
+| 恢复普通注意力/均值/竞争查询中的全物品聚合 | `--no-actor-feasible-attention` |
+
+前 3 个开关控制不同使用位置：关闭特征注入时，关系注意力和差异池化仍可使用关系特征；关系模块始终排除自身和无效候选。关闭第 4 项只恢复普通聚合中的全物品读取，不会把无效候选引入关系模块。四项全部关闭恢复 v3 的 Actor 结构，保留原有 v3 解码器与训练信号，但仍需以 v4 checkpoint 格式重新训练。
+
+关系特征计算额外需要 `O(BN²M)`，物品关系注意力约 `O(BN²D)`。`--actor-relation-chunk-size 32` 控制特征计算和注意力的查询分块，避免构造 `[B,N,N,D]` 的边 Value 张量；仍会缓存 `[B,N,N,7]` 关系及训练激活，**分块不意味着总内存对 N 线性增长**。N=250/500 的实际速度、显存及完整续行标注开销需正式运行测量。`--actor-relation-bandwidth 0.05` 控制余量平滑，`--actor-similarity-bandwidth 0.1` 控制相似候选权重。三个关系功能均关闭时跳过新增关系计算。
 
 ## 运行
 
@@ -21,7 +56,7 @@
 # 自行运行：只训练一个资源维度
 & 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' train_ConstrainedMKP.py --resources 5 --updates 2000
 # 自行运行：从 last checkpoint 继续，updates 是累计更新次数目标
-& 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' train_ConstrainedMKP.py --resources 5 --resume checkpoints/opportunity_v3/mkp_M5_last.pt --updates 4000
+& 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' train_ConstrainedMKP.py --resources 5 --resume checkpoints/controller_v4/mkp_M5_last.pt --updates 4000
 # 可选：另报 128 条随机轨迹中的最佳解，不替代单轨迹 greedy 结果
 & 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' Benchmark_zeroShot.py --sample-rollouts 128
 ```
@@ -36,6 +71,7 @@
 | `mkp_data.py`             | 调用现有 `read_mat.py`，统一数组方向；独立随机训练数据    |
 | `mkp_env.py`              | float64 容量与收益记账，逐步选择，终止与可行候选集合      |
 | `mkp_Model.py`            | 二分图多头 Transformer、高层策略、固定解码器、独立 Critic |
+| `mkp_attention.py`        | Actor 选后兼容特征、物品关系注意力、相似候选差异池化       |
 | `mkp_Trainer.py`          | 完整 episode 采样、GAE、PPO、合成验证、日志、checkpoint   |
 | `mkp_ranking.py`          | 关键候选筛选、固定策略成对续行、收益标签与排序损失       |
 | `train_ConstrainedMKP.py` | 简洁训练入口                                              |
@@ -46,8 +82,8 @@
 - `runs/<时间戳>/train.log`：每次更新的日志。
 - `runs/<时间戳>/metrics.csv`：收益、归一化 return、利用率、PPO 各项损失、归一化 entropy、KL、梯度范数、Critic explained variance、合成验证表现。
 - `runs/<时间戳>/config.json`：配置与运行环境。
-- `checkpoints/opportunity_v3/mkp_M5_best.pt`、同目录 `mkp_M10_best.pt`：按固定合成验证集的 greedy 归一化收益选择。
-- `checkpoints/opportunity_v3/mkp_M5_last.pt`、同目录 `mkp_M10_last.pt`：最近一次保存的模型，包含优化器和 RNG 状态；默认每 100 次更新、产生新 best 及训练结束时保存。
+- `checkpoints/controller_v4/mkp_M5_best.pt`、同目录 `mkp_M10_best.pt`：按固定合成验证集的 greedy 归一化收益选择。
+- `checkpoints/controller_v4/mkp_M5_last.pt`、同目录 `mkp_M10_last.pt`：最近一次保存的模型，包含优化器和 RNG 状态；默认每 100 次更新、产生新 best 及训练结束时保存。
 - `results/<时间戳>/instances.csv`：逐实例、逐方法报告。
 - `results/<时间戳>/summary.csv`：每种方法按 M/N 分组及总体报告。
 - `results/<时间戳>/solutions.jsonl`：零基索引物品选择顺序，可独立复核。
@@ -98,18 +134,18 @@ python mkp_diagnostics.py runs/<时间戳>
 绘图依赖 `matplotlib`；训练开始前会检查能否加载，避免长时间训练结束后才发现缺少绘图依赖。现有合约测试与新增诊断测试可用 `python -m unittest discover -s tests -v` 执行；新增流程测试使用模拟 rollout 和 PPO 指标，不执行真实优化或 Chu 推理。
 
 ## 当前代码中的二分图可以概括为：
-- 左侧节点：N 个物品节点。每个节点包含利润、初始资源消耗、当前可行性、是否已选择等 8 维特征。
+- 左侧节点：N 个物品节点。基础特征 8 维，默认 Actor 额外接收 4 维选后兼容特征，共 12 维；Critic 仍用基础 8 维。
 - 右侧节点：M 个资源节点。每个节点包含剩余容量比例、资源需求、已选择比例、可行物品比例等 6 维特征。
 - 边：每个物品与每个资源相连，即形成完整的物品—资源关系。边特征为：
   1. 初始消耗；
   2. 当前消耗；
   3. 当前相对容量的超额程度。
-代码中没有显式构造邻接矩阵，而是用 edge_features[B,N,M,3] 表示边。在 Actor 的交叉注意力中，边同时进入 attention bias 和 value 消息，资源占用信息可直接参与聚合；Critic 保留原有的独立编码器。
+基础边为 `edge_features[B,N,M,3]`，默认 Actor 拼接 2 维选后资源特征成为 5 维；边同时进入 attention bias 和 Value 消息。Actor 还读取 `[B,N,N,7]` 的物品对关系。Critic 保留原有独立编码器及 3 维资源边。
 Transformer 的作用是：
 1. 分别将物品节点和资源节点映射到统一的 embedding 空间；
 2. 通过物品→资源、资源→物品的交叉多头注意力，让两类节点交换信息，并利用边特征体现资源消耗关系；
 3. 通过各自的 self-attention，让物品之间比较利润与负载，资源之间比较紧张程度和瓶颈；
-4. 对所有节点进行池化，形成全局状态表示；
+4. 对可行物品及资源池化，再汇聚竞争查询与相似候选差异，形成全局状态表示；
 5. 高层策略头根据该表示输出低维策略参数 θ，包括：
    - 资源价格 resource_prices
    - 利润权重 profit_exponent
@@ -126,7 +162,7 @@ Transformer 的作用是：
 
 每个模块包含：物品→资源与资源→物品的带边偏置多头交叉注意力、物品间多头自注意力、资源间多头自注意力、前馈网络。默认 8 头、128 维、2 层。节点没有位置编码，支持不同 N/M 的输入；默认每个 M 单独训练，避免未经验证地宣称跨资源维度泛化。
 
-物品自注意力可学习收益与资源占用的竞争关系，资源自注意力可学习瓶颈资源的竞争关系，但**不预先宣称每个注意力头已经学到了某种语义**。Actor 在均值汇聚后增加 4 个可学习查询，通过注意力提取不同的物品/资源竞争摘要，避免只靠均值稀释少量关键节点。全局剩余容量、已选比例和累计收益也进入策略汇聚。已选和不可行物品仍可作为状态背景参与注意力。
+物品关系注意力可学习收益、负载与选后兼容关系，资源自注意力可学习瓶颈资源之间的关系，但**不预先宣称每个注意力头已经学到了某种语义**。Actor 在可行物品均值汇聚后使用 4 个可学习查询提取物品/资源竞争摘要，再增加相似候选差异池化。默认已选和不可行物品不作为 Actor 的物品消息来源；累计收益、已选比例等全局摘要及原有资源需求特征仍保留历史与背景信息。Critic 的全物品注意力保持原样。
 
 资源价格使用 `MLP(resource, global, resource * global)` 后再归一化。原来的线性拼接中，全局项对所有资源相同，会在 softmax 中抵消；现在全局状态能通过非线性交互改变资源之间的相对价格。
 
@@ -134,7 +170,7 @@ Transformer 的作用是：
 
 ### 关于 mask
 
-注意力没有 `attn_mask`/`key_padding_mask`，没有把不可行物品的策略 logits 设成 `-inf`。环境根据真实容量生成可行候选索引，解码器使用分段 softmax 构成不同候选数的 categorical 分布。终止行使用动作 `-1`。
+默认 Actor 在读取物品时使用可行性 attention mask，物品关系还排除自身；空候选行的注意力消息显式归零，避免全屏蔽 softmax 导致 NaN。资源节点始终可以参与竞争查询。Critic 保持无 attention mask。解码器仍根据环境的真实容量生成可行候选索引，使用分段 softmax 构成 categorical 分布，不构造包含不可行动作的 dense logits；终止行使用动作 `-1`。注意力掩码只控制信息聚合，最终动作合法性仍由环境检查。
 
 这里仍有布尔型“可行集合”和“已选状态”；它们是 MKP 的物理约束检查。完全取消可行性检查无法保证输出合法解。约束状态显式进入模型，合法性由环境再次检查，两者同时保留。评分公式内部的 `-inf` 仅用于表示零资源消耗的对数加法项，不是屏蔽物品 logits。
 
@@ -201,11 +237,11 @@ total_loss = 原 PPO/Value/可行性/Entropy 损失 + 0.1 * ranking_loss
 
 排序使用温度缩放**之前**的 score，模型不能只调低采样温度来满足排序监督。标签及续行均无梯度；梯度由固定 score 经 θ 回到 Actor，不进入 Critic。反事实分支不进入 PPO buffer，不改变 GAE/Value 的目标。每个 PPO minibatch 另外计算整个标签状态集合的全候选 KL，超过 `target_kl` 即停止后续更新，避免只检查已采样动作而遗漏其他候选的概率漂移。标签使用独立 RNG，不消耗主 rollout 随机流。
 
-`metrics.csv` / `train.log` 增加标签提议/接受数、平均终局收益差、标准误、标签耗时、排序损失、排序方向正确率和全候选 KL。`ranking_accuracy` 是当轮被接受训练对上的方向正确率；没有接受对时记 0，应结合 `ranking_pairs` 阅读，不能当作独立验证精度。Benchmark 新增 λ、ρ 均值，checkpoint/manifest 保存 v3 版本与完整模型配置。推理不执行反事实续行。
+`metrics.csv` / `train.log` 记录标签提议/接受数、平均终局收益差、标准误、标签耗时、排序损失、排序方向正确率和全候选 KL。`ranking_accuracy` 是当轮被接受训练对上的方向正确率；没有接受对时记 0，应结合 `ranking_pairs` 阅读，不能当作独立验证精度。Benchmark 记录 λ、ρ 均值，checkpoint/manifest 保存 v4 控制器标识、原 v3 解码器标识与完整模型配置。推理不执行反事实续行。
 
 ### 运行与独立消融
 
-默认命令已开启全部改动。下面的开关用于分别检验贡献，建议每组使用相同种子、训练预算及独立 checkpoint 目录，最终比较同一批实例的配对收益/gap：
+默认命令已开启全部改动。以下是原 v3 机制的开关，可与前述 v4 控制器开关组合。建议每组使用相同种子、训练预算及独立 checkpoint 目录，最终比较同一批实例的配对收益/gap：
 
 | 关闭的部分 | 训练参数 |
 | --- | --- |
@@ -257,7 +293,11 @@ python Benchmark_zeroShot.py --checkpoint-dir checkpoints/ablation_no_ranking
 
 ## 交付验证
 
-测试检查小张量上的候选概率、固定公式、约束拒绝、终止/GAE、排列等变性、高层梯度、checkpoint 往返及独立解校验。`tests/test_opportunity_ranking.py` 额外检查关键选择翻转、微型实例的固定策略终局收益、共享随机数、排序梯度、温度不变性和全候选 KL；PPO 接线测试以 mock 替代优化器 step。未执行真实参数更新、完整训练或 Chu 评估。训练收敛性、实际 GPU 内存/速度和最终 gap 需在正式实验中验证。
+测试检查小张量上的候选概率、固定公式、约束拒绝、终止/GAE、排列等变性、高层梯度、checkpoint 往返及独立解校验。`tests/test_opportunity_ranking.py` 检查关键选择翻转、微型实例的固定策略终局收益、共享随机数、排序梯度、温度不变性和全候选 KL；PPO 接线测试以 mock 替代优化器 step。
+
+`tests/test_controller_attention.py` 新增 12 项测试：A/B 选后特征及资源归因、float64 容量边界、排除自身/无效候选、分块和排列一致性、相同节点 Value 下的关系区分、无效 token 的聚合隔离、带方向的差异池化、排序梯度到新增模块、终止/单候选 backward、独立开关组合与解码器一致性、checkpoint/CLI、N=100/250/500 与不同 M 的单状态前向。**未执行真实参数更新、完整训练或 Chu 评估。** 这些测试不证明学习到正确终局排序，也不证明 gap 下降；训练收敛性、实际 GPU 内存/速度和最终 gap 需在正式实验中验证。
+
+本次接口回归：`python -m unittest discover -s tests -v` 共 **53 项通过**，包括现有 CUDA 确定性梯度检查。源码 AST 对比确认 `StrategyTheta`、`HighLevelController` 输出头、`CandidatePolicy` 和 `WeakDecoder` 实现未改变；Python 源码编译检查与 `git diff --check` 通过。
 
 
 ## 全流程如下：
@@ -277,12 +317,12 @@ python Benchmark_zeroShot.py --checkpoint-dir checkpoints/ablation_no_ranking
 4. 二分图 Transformer 编码
    对物品节点和资源节点分别嵌入，然后重复执行：
    - 物品与资源之间的双向交叉注意力
-   - 物品节点内部 self-attention
+   - Actor 物品节点间带选后兼容关系的注意力
    - 资源节点内部 self-attention
    - 残差连接、LayerNorm 和前馈网络
    Actor 将边特征用于 attention bias 与 value 消息，影响物品—资源之间的信息交互。
 5. 全局状态聚合
-   对物品节点和资源节点分别平均池化，并与全局特征拼接，再通过可学习查询提取竞争摘要，得到 pooled。
+   对可行物品节点和资源节点分别池化，与全局特征拼接，再通过可学习查询提取竞争摘要，并聚合相似候选的有向差异，得到 pooled。
 6. 高层策略生成
    pooled 输入高层策略头，输出策略参数 θ：
    - 资源价格

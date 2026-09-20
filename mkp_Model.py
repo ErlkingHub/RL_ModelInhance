@@ -10,6 +10,9 @@ import torch
 from torch import nn
 from mkp_config import ModelConfig
 from mkp_env import MKPState
+from mkp_attention import (POST_DIM, RESOURCE_POST_DIM, candidate_relations,
+                           PairRelationAttention, CriticalContrastPool,
+                           masked_softmax, safe_key_padding_mask)
 
 
 def state_features(state: MKPState, config: ModelConfig):
@@ -45,40 +48,48 @@ def state_features(state: MKPState, config: ModelConfig):
 
 
 class EdgeCrossAttention(nn.Module):
-    """Multihead cross-attention with resource-consumption edge biases, no masks."""
-    def __init__(self, config, edge_values=False):
+    """Multihead cross-attention with resource-consumption edge messages."""
+    def __init__(self, config, edge_values=False, edge_dim=3):
         super().__init__()
         d = config.embed_dim
         self.heads = config.num_heads
         self.head_dim = d // self.heads
         self.q, self.k, self.v = (nn.Linear(d, d) for _ in range(3))
-        self.edge_bias = nn.Sequential(nn.Linear(3, d // 2), nn.GELU(), nn.Linear(d // 2, self.heads))
+        self.edge_bias = nn.Sequential(nn.Linear(edge_dim, d // 2), nn.GELU(), nn.Linear(d // 2, self.heads))
         self.output = nn.Linear(d, d)
-        self.edge_value = nn.Linear(3, d, bias=False) if edge_values else None
+        self.edge_value = nn.Linear(edge_dim, d, bias=False) if edge_values else None
 
-    def forward(self, queries, context, edges):
+    def forward(self, queries, context, edges, context_valid=None):
         b, nq, d = queries.shape
         nk = context.shape[1]
         q = self.q(queries).view(b, nq, self.heads, self.head_dim).transpose(1, 2)
         k = self.k(context).view(b, nk, self.heads, self.head_dim).transpose(1, 2)
         v = self.v(context).view(b, nk, self.heads, self.head_dim).transpose(1, 2)
         bias = self.edge_bias(edges).permute(0, 3, 1, 2)
-        attention = (q @ k.transpose(-1, -2) / math.sqrt(self.head_dim) + bias).softmax(-1)
+        logits = q @ k.transpose(-1, -2) / math.sqrt(self.head_dim) + bias
+        attention = (logits.softmax(-1) if context_valid is None else
+                     masked_softmax(logits, context_valid[:, None, None]))
         result = attention @ v
         if self.edge_value is not None:
             edge_v = self.edge_value(edges).view(b, nq, nk, self.heads, self.head_dim)
             result = result + torch.einsum("bhij,bijhd->bhid", attention, edge_v)
         result = result.transpose(1, 2).reshape(b, nq, d)
-        return self.output(result)
+        result = self.output(result)
+        if context_valid is not None:
+            result = result * context_valid.any(-1)[:, None, None]
+        return result
 
 
 class BipartiteBlock(nn.Module):
     def __init__(self, config, strategy=False):
         super().__init__()
         d, h = config.embed_dim, config.num_heads
-        self.item_cross = EdgeCrossAttention(config, strategy and config.actor_edge_values)
-        self.resource_cross = EdgeCrossAttention(config, strategy and config.actor_edge_values)
-        self.item_self = nn.MultiheadAttention(d, h, dropout=0.0, batch_first=True)
+        edge_dim = 3 + RESOURCE_POST_DIM if strategy and config.actor_postdecision_features else 3
+        self.item_cross = EdgeCrossAttention(config, strategy and config.actor_edge_values, edge_dim)
+        self.resource_cross = EdgeCrossAttention(config, strategy and config.actor_edge_values, edge_dim)
+        self.pair_attention = strategy and config.actor_pair_attention
+        self.item_self = (PairRelationAttention(config) if self.pair_attention else
+                          nn.MultiheadAttention(d, h, dropout=0.0, batch_first=True))
         self.resource_self = nn.MultiheadAttention(d, h, dropout=0.0, batch_first=True)
         self.item_norms = nn.ModuleList([nn.LayerNorm(d) for _ in range(3)])
         self.resource_norms = nn.ModuleList([nn.LayerNorm(d) for _ in range(3)])
@@ -87,13 +98,20 @@ class BipartiteBlock(nn.Module):
                                  nn.Linear(d * config.ff_multiplier, d))
         self.item_ff, self.resource_ff = ff(), ff()
 
-    def forward(self, items, resources, edges):
+    def forward(self, items, resources, edges, feasible=None, relations=None):
         i, r = self.item_norms[0](items), self.resource_norms[0](resources)
         items = items + self.item_cross(i, r, edges)
-        resources = resources + self.resource_cross(r, i, edges.transpose(1, 2))
+        resources = resources + self.resource_cross(r, i, edges.transpose(1, 2), feasible)
         i, r = self.item_norms[1](items), self.resource_norms[1](resources)
         # Item attention can compare profit/load tradeoffs; resource attention compares bottlenecks.
-        items = items + self.item_self(i, i, i, need_weights=False)[0]
+        if self.pair_attention:
+            item_message = self.item_self(i, relations)
+        else:
+            mask = None if feasible is None else safe_key_padding_mask(feasible)
+            item_message = self.item_self(i, i, i, key_padding_mask=mask, need_weights=False)[0]
+            if feasible is not None:
+                item_message = item_message * feasible.any(-1)[:, None, None]
+        items = items + item_message
         resources = resources + self.resource_self(r, r, r, need_weights=False)[0]
         return (items + self.item_ff(self.item_norms[2](items)),
                 resources + self.resource_ff(self.resource_norms[2](resources)))
@@ -103,12 +121,15 @@ class BipartiteEncoder(nn.Module):
     def __init__(self, config: ModelConfig, strategy=False):
         super().__init__()
         self.config = config
+        self.strategy = strategy
         d = config.embed_dim
-        self.item_input, self.resource_input = nn.Linear(8, d), nn.Linear(6, d)
+        item_dim = 8 + POST_DIM if strategy and config.actor_postdecision_features else 8
+        self.item_input, self.resource_input = nn.Linear(item_dim, d), nn.Linear(6, d)
         self.blocks = nn.ModuleList([BipartiteBlock(config, strategy) for _ in range(config.num_layers)])
         self.item_norm, self.resource_norm = nn.LayerNorm(d), nn.LayerNorm(d)
         self.pool = nn.Sequential(nn.Linear(2 * d + 6, d), nn.GELU(), nn.LayerNorm(d))
         self.queries = None
+        self.contrast_pool = CriticalContrastPool(config) if strategy and config.actor_contrast_pooling else None
         if strategy and config.opportunity_tokens:
             self.queries = nn.Parameter(torch.randn(config.opportunity_tokens, d) / math.sqrt(d))
             self.opportunity_attention = nn.MultiheadAttention(d, config.num_heads, batch_first=True)
@@ -117,17 +138,32 @@ class BipartiteEncoder(nn.Module):
 
     def forward(self, state):
         item_f, resource_f, edges, global_f = state_features(state, self.config)
+        c = self.config
+        relations = None
+        if self.strategy and (c.actor_postdecision_features or c.actor_pair_attention or c.actor_contrast_pooling):
+            relations = candidate_relations(state, c)
+        if self.strategy and c.actor_postdecision_features:
+            item_f = torch.cat((item_f, relations.post), -1)
+            edges = torch.cat((edges, relations.resource_post), -1)
+        feasible = state.feasible if self.strategy and c.actor_feasible_attention else None
         items, resources = self.item_input(item_f), self.resource_input(resource_f)
         for block in self.blocks:
-            items, resources = block(items, resources, edges)
+            items, resources = block(items, resources, edges, feasible, relations)
         items, resources = self.item_norm(items), self.resource_norm(resources)
-        pooled = self.pool(torch.cat((items.mean(1), resources.mean(1), global_f), dim=-1))
+        item_mean = (items.mean(1) if feasible is None else
+                     (items * feasible[..., None]).sum(1) / feasible.sum(-1, keepdim=True).clamp_min(1))
+        pooled = self.pool(torch.cat((item_mean, resources.mean(1), global_f), dim=-1))
         if self.queries is not None:
-            # Learned summaries attend to all nodes, without emitting item logits.
+            # Resources remain valid keys, including when a row has no candidates.
             context = torch.cat((items, resources), dim=1)
+            mask = None if feasible is None else torch.cat((~feasible,
+                torch.zeros(resources.shape[:2], dtype=torch.bool, device=items.device)), 1)
             queries = self.queries[None].expand(items.shape[0], -1, -1) + pooled[:, None]
-            summary = self.opportunity_attention(queries, context, context, need_weights=False)[0]
+            summary = self.opportunity_attention(queries, context, context,
+                                                  key_padding_mask=mask, need_weights=False)[0]
             pooled = self.opportunity_pool(torch.cat((pooled, summary.flatten(1)), -1))
+        if self.contrast_pool is not None:
+            pooled = self.contrast_pool(items, pooled, relations)
         return items, resources, pooled
 
 
@@ -291,7 +327,7 @@ class WeakDecoder:
         eps = self.config.eps
         p, w, c, rem = (x.float() for x in
                         (state.profits, state.weights, state.capacities, state.remaining))
-        # Calculate only feasible-item scores; infeasible nodes still entered the encoder.
+        # Calculate only feasible-item scores; Actor attention does not define legality.
         candidate_w = w[owners, items]
         scale = state.profits.shape[1]
         log_scarcity = (c[owners].clamp_min(eps).log() - rem[owners].clamp_min(eps).log())

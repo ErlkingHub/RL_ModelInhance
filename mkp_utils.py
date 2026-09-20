@@ -7,7 +7,7 @@ from pathlib import Path
 import random
 import numpy as np
 import torch
-from mkp_config import CHECKPOINT_VERSION, DECODER_VERSION, ModelConfig
+from mkp_config import CHECKPOINT_VERSION, CONTROLLER_VERSION, DECODER_VERSION, ModelConfig
 from mkp_env import MKPEnv
 from mkp_Model import MKPModel, WeakDecoder
 
@@ -58,8 +58,10 @@ def load_checkpoint(path, device, expected_m=None):
     # Checkpoints are local trusted training artifacts; loading still uses restricted unpickling.
     payload = torch.load(path, map_location="cpu", weights_only=True)
     if payload.get("checkpoint_version") != CHECKPOINT_VERSION:
-        raise ValueError("Incompatible checkpoint schema: opportunity v3 requires a fresh training run; "
-                         "v1/v2 weights cannot be resumed as the new controller")
+        raise ValueError("Incompatible checkpoint schema: controller v4 requires a fresh training run; "
+                         "v1/v2/v3 weights cannot be resumed as the new controller")
+    if payload.get("controller_version") != CONTROLLER_VERSION:
+        raise ValueError("Checkpoint's high-level controller differs from this implementation")
     if payload.get("decoder_version") != DECODER_VERSION:
         raise ValueError("Checkpoint's weak decoder differs from this implementation")
     if expected_m is not None and payload["num_resources"] != expected_m:

@@ -134,6 +134,7 @@ def benchmark(config=None):
         models[m].eval().requires_grad_(False)
         metadata[str(m)] = {"path": str(checkpoint.resolve()), "sha256": file_sha256(checkpoint),
                             "checkpoint_version": payload["checkpoint_version"],
+                            "controller_version": payload["controller_version"],
                             "decoder_version": payload["decoder_version"],
                             "update": payload["update"], "model_config": payload["model_config"],
                             "train_num_items": payload["train_config"]["train_num_items"],
