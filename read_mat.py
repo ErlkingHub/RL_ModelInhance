@@ -36,6 +36,38 @@ def read_mat(filename):
         return []
 
 
+def read_GK(filename):
+    '''
+    解析 GK .mat 文件中的所有实例，返回与 read_mat 相同格式的字典列表。
+    例如：read_GK("MKP_dataset/Benchmarks_GK.mat")。
+    '''
+    print(f"Loading {filename}...")
+    try:
+        if np is None:
+            raise ModuleNotFoundError("numpy is required to read .mat benchmark files")
+        if sio is None:
+            raise ModuleNotFoundError("scipy is required to read .mat benchmark files")
+        mat_data = sio.loadmat(filename)
+        matrix = mat_data['Problem']
+        data_list = []
+        # GK 与 Chu 的字段顺序不同，按字段名读取以避免错位。
+        for i, current_row in enumerate(matrix.flat):
+            instance = {
+                "id": i + 1,
+                "M": int(current_row['m'].item()),
+                "N": int(current_row['n'].item()),
+                "P": np.array(current_row['P'], dtype=np.float64),
+                "R": np.array(current_row['R'], dtype=np.float64),
+                "B": np.array(current_row['B'], dtype=np.float64),
+                "best": float(current_row['best'].item()),
+            }
+            data_list.append(instance)
+        return data_list
+    except Exception as e:
+        print(f"Error: {e}")
+        return []
+
+
 def read_mat_specified(filename, index = 0):
     '''
     解析指定的 .mat 文件中的单个实例，并返回该实例的字典表示。

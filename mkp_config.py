@@ -4,9 +4,9 @@ import math
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-CHECKPOINT_VERSION = 4
-CONTROLLER_VERSION = "candidate_relations_v4"
-DECODER_VERSION = "opportunity_density_v3"
+CHECKPOINT_VERSION = 5
+CONTROLLER_VERSION = "combination_theta_v5"
+DECODER_VERSION = "second_order_density_v5"
 
 @dataclass
 class TrainConfig:
@@ -52,17 +52,26 @@ class TrainConfig:
     device: str = "auto"
     deterministic: bool = True
     cpu_threads: int = 4
+    # Execution only: preserve PPO batch sizes, precision and checkpoint schema.
+    performance_profile: str = "auto"  # >=20 GiB CUDA -> memory24; otherwise reference
+    feature_cache_gib: float = 6.0
+    cache_headroom_gib: float = 6.0
+    feature_cache_batch_size: int = 64
     runs_dir: Path = field(default_factory=lambda: ROOT / "runs")
-    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / "controller_v4")
+    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / "combination_v5")
 
     def __post_init__(self):
         counts = (self.updates, self.batch_size, self.minibatch_size, self.ppo_epochs,
                   self.validation_every, self.validation_instances_per_shape,
                   self.checkpoint_every, self.cpu_threads, self.convergence_min_updates,
                   self.convergence_patience_updates, self.convergence_min_evaluations,
-                  self.plot_smoothing_updates)
+                  self.plot_smoothing_updates, self.feature_cache_batch_size)
         if any(x < 1 for x in counts):
             raise ValueError("Training counts/intervals must be positive")
+        if self.performance_profile not in ("auto", "reference", "memory24"):
+            raise ValueError("performance_profile must be auto, reference or memory24")
+        if not all(math.isfinite(x) and x >= 0 for x in (self.feature_cache_gib, self.cache_headroom_gib)):
+            raise ValueError("Cache budget and headroom must be finite and nonnegative")
         if not self.num_resources or any(x < 1 for x in self.num_resources):
             raise ValueError("num_resources must be positive")
         if not self.train_num_items or any(x < 1 for x in self.train_num_items):
@@ -123,6 +132,12 @@ class ModelConfig:
     reserve_weight_max: float = 4.0
     opportunity_bandwidth: float = 0.05
     opportunity_chunk_size: int = 128
+    # State-level basis coefficients; their dimensions do not grow with N.
+    interaction_weight_max: float = 2.0
+    companion_weight_max: float = 2.0
+    combination_initial_weight: float = 0.02
+    companion_scales: tuple[float, ...] = (0.5, 2.0, 8.0)
+    combination_chunk_size: int = 64
     eps: float = 1e-8
 
     def __post_init__(self):
@@ -153,6 +168,17 @@ class ModelConfig:
         if not all(math.isfinite(x) for x in (self.opportunity_weight_max, self.reserve_weight_max,
                                              self.opportunity_bandwidth)):
             raise ValueError("Opportunity score settings must be finite")
+        self.companion_scales = tuple(self.companion_scales)
+        if not self.companion_scales or any(not math.isfinite(x) or x <= 0 for x in self.companion_scales):
+            raise ValueError("companion_scales must be finite and positive")
+        if tuple(sorted(set(self.companion_scales))) != self.companion_scales:
+            raise ValueError("companion_scales must be strictly increasing")
+        if not all(math.isfinite(x) and x >= 0 for x in (self.interaction_weight_max, self.companion_weight_max)):
+            raise ValueError("Combination weight bounds must be finite and nonnegative")
+        if not math.isfinite(self.combination_initial_weight) or self.combination_initial_weight <= 0:
+            raise ValueError("combination_initial_weight must be finite and positive")
+        if self.combination_chunk_size < 1:
+            raise ValueError("combination_chunk_size must be positive")
 
 
 @dataclass
@@ -179,7 +205,7 @@ class BenchmarkConfig:
     dataset: Path = field(default_factory=lambda: ROOT / "MKP_dataset" / "Benchmarks_Chu.mat")
     num_resources: tuple[int, ...] = (5, 10)
     num_items: tuple[int, ...] = (100, 250, 500)
-    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / "controller_v4")
+    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / "combination_v5")
     results_dir: Path = field(default_factory=lambda: ROOT / "results")
     checkpoint_tag: str = "best"
     device: str = "auto"

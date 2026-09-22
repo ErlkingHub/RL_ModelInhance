@@ -31,7 +31,7 @@ def paired_terminal_returns(model, state, left, right, repeats, stochastic, gene
         raise ValueError("Continuation repeats must be positive")
     b, n = state.profits.shape
     indices = torch.arange(b, device=left.device).repeat_interleave(repeats * 2)
-    env = MKPEnv.from_state(state.index(indices))
+    env = MKPEnv.from_state(state.index(indices, with_features=False))
     actions = torch.stack((left, right), -1)[:, None].expand(-1, repeats, -1).reshape(-1)
     env.step(actions)
     for _ in range(n - 1):

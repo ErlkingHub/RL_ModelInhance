@@ -1,5 +1,5 @@
 """Batched dynamic MKP. Float64 accounting; learned features use float32."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import torch
 
 
@@ -11,18 +11,25 @@ class MKPState:
     remaining: torch.Tensor        # [B, M], float64
     selected: torch.Tensor         # [B, N], bool
 
+    _prepared: object = field(default=None, repr=False, compare=False)
+
     @property
     def feasible(self):
         # Physical action set; also available to Actor attention for candidate aggregation.
+        if self._prepared is not None and self._prepared.valid_for(self):
+            return self._prepared.tensors["feasible"]
         return (~self.selected) & (self.weights <= self.remaining[:, None, :]).all(dim=-1)
 
     @property
     def active(self):
         return self.feasible.any(dim=-1)
 
-    def index(self, indices):
-        return MKPState(*(x[indices] for x in
-                         (self.profits, self.weights, self.capacities, self.remaining, self.selected)))
+    def index(self, indices, with_features=True):
+        state = MKPState(*(x[indices] for x in
+                          (self.profits, self.weights, self.capacities, self.remaining, self.selected)))
+        if with_features and self._prepared is not None and self._prepared.valid_for(self):
+            state._prepared = self._prepared.index(indices, state)
+        return state
 
 
 class MKPEnv:

@@ -18,7 +18,10 @@ from mkp_config import (CHECKPOINT_VERSION, CONTROLLER_VERSION, DECODER_VERSION,
 from mkp_data import synthetic_batch
 from mkp_env import MKPEnv, MKPState
 from mkp_Model import MKPModel
+from mkp_basis import COMBINATION_METRICS, decoder_statistics
 from mkp_ranking import collect_ranking_batch, ranking_objective, ranking_kl
+from mkp_performance import (GIB, PERFORMANCE_FIELDS, configure_training_runtime,
+                             build_rollout_cache, prepare_state)
 from mkp_diagnostics import convergence_report, plot_training, prepare_plotting
 from mkp_utils import (atomic_checkpoint, construct_solution, load_checkpoint, resolve_device,
                        seed_everything, write_json)
@@ -44,11 +47,16 @@ def collect_rollout(model, data):
     records = {key: [] for key in ("remaining", "selected", "actions", "log_probs",
                                   "values", "rewards", "dones", "active")}
     model.eval()  # no dropout anywhere: collection and PPO recomputation agree
+    combination_sum = data[0].new_zeros(len(COMBINATION_METRICS), dtype=torch.float32)
+    transition_count = data[0].new_zeros((), dtype=torch.float32)
     for _ in range(data[0].shape[1]):
         active = env.state.active
         if not active.any():
             break
-        policy, value, _, _ = model(env.state)
+        policy, value, theta, _ = model(env.state)
+        combination = torch.cat((theta.statistics()[:, -2:], decoder_statistics(policy)), -1)
+        combination_sum += (combination * active[:, None]).sum(0)
+        transition_count += active.sum()
         actions = policy.choose(stochastic=True)
         records["remaining"].append(env.state.remaining.clone())
         records["selected"].append(env.state.selected.clone())
@@ -66,6 +74,8 @@ def collect_rollout(model, data):
     result = {k: torch.stack(v) for k, v in records.items()}
     result["objective"] = env.objective
     result["utilization"] = (1 - env.state.remaining / env.state.capacities).mean()
+    result["combination_metrics"] = dict(zip(COMBINATION_METRICS,
+                                              (combination_sum / transition_count.clamp_min(1)).tolist()))
     return result
 
 
@@ -94,6 +104,8 @@ class MKPTrainer:
         self.fields += ["ranking_proposed", "ranking_pairs", "ranking_abs_return_gap",
                         "ranking_standard_error", "ranking_label_seconds", "ranking_loss",
                         "ranking_accuracy", "ranking_kl", "ranking_minibatches"]
+        self.fields += list(COMBINATION_METRICS)
+        self.fields += list(PERFORMANCE_FIELDS)
         with (self.run_dir / "metrics.csv").open("w", newline="", encoding="utf-8") as f:
             csv.DictWriter(f, fieldnames=self.fields).writeheader()
         write_json(self.run_dir / "config.json", {
@@ -110,6 +122,10 @@ class MKPTrainer:
         advantages, returns = generalized_advantage(rollout["rewards"], rollout["values"],
             rollout["dones"], rollout["active"], c.gamma, c.gae_lambda)
         times, batches = rollout["active"].nonzero(as_tuple=True)
+        ppo_began = time.perf_counter()
+        state_bank, cache_stats = build_rollout_cache(model, data, rollout, times, batches, c)
+        if ranking is not None and model.reuse_state_features:
+            prepare_state(ranking.state, model.feature_config)
         adv = advantages[times, batches]
         normalized_adv = (adv - adv.mean()) / adv.std(unbiased=False).clamp_min(1e-8)
         targets = returns[times, batches]
@@ -117,17 +133,21 @@ class MKPTrainer:
         old_log_probs = rollout["log_probs"][times, batches]
         actions = rollout["actions"][times, batches]
         model.train()
-        sums = {k: 0.0 for k in ("policy_loss", "value_loss", "constraint_aux_loss", "entropy",
-                                "approx_kl", "clip_fraction", "grad_norm")}
+        metric_names = ("policy_loss", "value_loss", "constraint_aux_loss", "entropy",
+                        "approx_kl", "clip_fraction", "grad_norm")
+        sums = torch.zeros(len(metric_names), device=self.device)
         minibatches, observations, stopped = 0, 0, False
-        ranking_sums = dict(ranking_loss=0., ranking_accuracy=0.)
+        ranking_sums = torch.zeros(2, device=self.device)
         ranking_updates, max_ranking_kl = 0, 0.
         for _ in range(c.ppo_epochs):
             order = torch.randperm(times.numel(), device=self.device)
             for ids in order.split(c.minibatch_size):
-                b, t = batches[ids], times[ids]
-                state = MKPState(data[0][b], data[1][b], data[2][b],
-                                 rollout["remaining"][t, b], rollout["selected"][t, b])
+                if state_bank is not None:
+                    state = state_bank.index(ids)
+                else:
+                    b, t = batches[ids], times[ids]
+                    state = MKPState(data[0][b], data[1][b], data[2][b],
+                                     rollout["remaining"][t, b], rollout["selected"][t, b])
                 policy, values, _, constraint_logits = model(state)
                 log_ratio = policy.log_prob(actions[ids]) - old_log_probs[ids]
                 ratio = log_ratio.exp()
@@ -163,28 +183,28 @@ class MKPTrainer:
                                                           error_if_nonfinite=True)
                 optimizer.step()
                 if ranking is not None:
-                    ranking_sums["ranking_loss"] += rank_loss.detach().item()
-                    ranking_sums["ranking_accuracy"] += rank_accuracy.item()
+                    ranking_sums += torch.stack((rank_loss.detach(), rank_accuracy.detach()))
                     ranking_updates += 1
                 metrics = (policy_loss, value_loss, constraint_loss, entropy, approximate_kl,
                            ((ratio - 1).abs() > c.clip_ratio).float().mean(), grad_norm)
-                for key, val in zip(sums, metrics):
-                    sums[key] += val.detach().item() * ids.numel()
+                sums += torch.stack([val.detach() for val in metrics]) * ids.numel()
                 observations += ids.numel()
                 minibatches += 1
             if stopped:
                 break
         variance = targets.var(unbiased=False)
         explained = (1 - (targets - old_values).var(unbiased=False) / variance).item() if variance > 1e-12 else float("nan")
-        result = {k: v / max(1, observations) for k, v in sums.items()}
+        result = dict(zip(metric_names, (sums / max(1, observations)).tolist()))
         result.update(minibatches=minibatches, kl_stopped=int(stopped), explained_variance=explained)
         if ranking is not None:
             final_kl = ranking_kl(model, ranking).item()
             if not math.isfinite(final_kl):
                 raise FloatingPointError("Non-finite final ranking KL")
             max_ranking_kl = max(max_ranking_kl, final_kl)
-        result.update(ranking_stats, **{k: v / max(1, ranking_updates) for k, v in ranking_sums.items()},
+        result.update(ranking_stats, **dict(zip(("ranking_loss", "ranking_accuracy"),
+                      (ranking_sums / max(1, ranking_updates)).tolist())),
                       ranking_kl=max_ranking_kl, ranking_minibatches=ranking_updates)
+        result.update(cache_stats, ppo_seconds=time.perf_counter() - ppo_began)
         return result
 
     def train(self, resume=None):
@@ -229,6 +249,9 @@ class MKPTrainer:
                                     m, start)
             if start > c.updates:
                 raise ValueError("--updates is the total target and must exceed the resumed update")
+        runtime = configure_training_runtime(model, c, self.device)
+        write_json(self.run_dir / f"runtime_M{m}.json", runtime)
+        self.logger.info("M=%d RUNTIME | %s", m, runtime)
         # Fixed held-out synthetic validation has an independent RNG and only training N shapes.
         vrng = np.random.default_rng(c.validation_seed + m)
         validation = [synthetic_batch(c.validation_instances_per_shape, n, m, self.generator_config,
@@ -251,10 +274,19 @@ class MKPTrainer:
                          m, c.convergence_tolerance_pct, c.convergence_patience_updates,
                          c.convergence_min_evaluations, c.convergence_min_updates, c.updates)
         for update in range(start, c.updates + 1):
+            if self.device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(self.device)
             n = int(rng.choice(c.train_num_items))
             data = synthetic_batch(c.batch_size, n, m, self.generator_config, rng, self.device)
+            rollout_began = time.perf_counter()
             rollout = collect_rollout(model, data)
+            rollout_seconds = time.perf_counter() - rollout_began
             stats = self.ppo_update(model, optimizer, data, rollout, update)
+            stats.update(rollout_seconds=rollout_seconds,
+                         gpu_peak_allocated_gib=(torch.cuda.max_memory_allocated(self.device) / GIB
+                                                 if self.device.type == "cuda" else 0.),
+                         gpu_peak_reserved_gib=(torch.cuda.max_memory_reserved(self.device) / GIB
+                                                if self.device.type == "cuda" else 0.))
             validation_return, improvement = None, None
             improved = False
             if update == start or update % c.validation_every == 0 or update == c.updates:
@@ -267,7 +299,7 @@ class MKPTrainer:
             row = dict(M=m, N=n, update=update, transitions=int(rollout["active"].sum()),
                        objective_mean=rollout["objective"].mean().item(),
                        normalized_return=(rollout["objective"] / data[0].sum(-1)).mean().item(),
-                       utilization=rollout["utilization"].item(), **stats,
+                       utilization=rollout["utilization"].item(), **stats, **rollout.get("combination_metrics", {}),
                        validation_return=validation_return, validation_improvement_pct=improvement,
                        best_validation_return=best, elapsed_seconds=time.perf_counter() - began)
             history.append(row)
@@ -278,12 +310,20 @@ class MKPTrainer:
                              m, update, c.updates, n, row["normalized_return"], stats["policy_loss"],
                              stats["value_loss"], stats["entropy"], stats["approx_kl"], stats["clip_fraction"],
                              stats["grad_norm"], stats["explained_variance"], validation_return)
+            self.logger.info("M=%d update=%d COMBINATION | interaction_mass=%.5f companion_mass=%.5f "
+                             "penalty=%.5f bonus=%.5f abs_delta=%.5f margin_ratio=%.5f",
+                             m, update, *(row.get(key, 0.) for key in COMBINATION_METRICS))
             self.logger.info("M=%d update=%d RANKING | accepted=%d/%d loss=%.5f accuracy=%.4f "
                              "return_gap=%.6f SE=%.6f KL=%.5f label_seconds=%.2f",
                              m, update, stats.get("ranking_pairs", 0), stats.get("ranking_proposed", 0),
                              stats.get("ranking_loss", 0.), stats.get("ranking_accuracy", 0.),
                              stats.get("ranking_abs_return_gap", 0.), stats.get("ranking_standard_error", 0.),
                              stats.get("ranking_kl", 0.), stats.get("ranking_label_seconds", 0.))
+            self.logger.info("M=%d update=%d SPEED | rollout=%.2fs labels=%.2fs PPO=%.2fs "
+                             "cache=%.3fGiB build=%.2fs peak_allocated=%.2fGiB peak_reserved=%.2fGiB",
+                             m, update, stats["rollout_seconds"], stats.get("ranking_label_seconds", 0.),
+                             stats["ppo_seconds"], stats["feature_cache_gib"], stats["feature_cache_seconds"],
+                             stats["gpu_peak_allocated_gib"], stats["gpu_peak_reserved_gib"])
             if validation_return is not None:
                 report = convergence_report(history, c)
                 plateau = (report["plateau_start_update"], report["confirmation_update"])
@@ -299,7 +339,7 @@ class MKPTrainer:
                            "model_config": config_dict(self.model_config), "train_config": config_dict(c),
                            "generator_config": config_dict(self.generator_config), "num_resources": m,
                            "training_data_source": "synthetic_only", "update": update,
-                           "diagnostics_history": history,
+                           "diagnostics_history": history, "training_runtime": runtime,
                            "best_validation_return": best, "model_state": model.state_dict(),
                            "optimizer_state": optimizer.state_dict(), "numpy_generator_state": rng.bit_generator.state,
                            "torch_rng_state": torch.get_rng_state(),
@@ -332,6 +372,11 @@ def main(argv=None):
     parser.add_argument("--batch-size", type=int, default=defaults.batch_size)
     parser.add_argument("--minibatch-size", type=int, default=defaults.minibatch_size)
     parser.add_argument("--device", default=defaults.device)
+    parser.add_argument("--performance-profile", choices=("auto", "reference", "memory24"),
+                        default=defaults.performance_profile)
+    parser.add_argument("--feature-cache-gib", type=float, default=defaults.feature_cache_gib)
+    parser.add_argument("--cache-headroom-gib", type=float, default=defaults.cache_headroom_gib)
+    parser.add_argument("--feature-cache-batch-size", type=int, default=defaults.feature_cache_batch_size)
     parser.add_argument("--seed", type=int, default=defaults.seed)
     parser.add_argument("--resume", default=None)
     parser.add_argument("--checkpoint-dir", type=Path, default=defaults.checkpoint_dir)
@@ -352,13 +397,20 @@ def main(argv=None):
     parser.add_argument("--actor-relation-chunk-size", type=int, default=model_defaults.actor_relation_chunk_size)
     parser.add_argument("--actor-relation-bandwidth", type=float, default=model_defaults.actor_relation_bandwidth)
     parser.add_argument("--actor-similarity-bandwidth", type=float, default=model_defaults.actor_similarity_bandwidth)
+    parser.add_argument("--interaction-weight-max", type=float, default=model_defaults.interaction_weight_max)
+    parser.add_argument("--companion-weight-max", type=float, default=model_defaults.companion_weight_max)
+    parser.add_argument("--combination-initial-weight", type=float, default=model_defaults.combination_initial_weight)
+    parser.add_argument("--companion-scales", type=float, nargs="+", default=model_defaults.companion_scales)
+    parser.add_argument("--combination-chunk-size", type=int, default=model_defaults.combination_chunk_size)
     args = parser.parse_args(argv)
     config = TrainConfig(num_resources=tuple(args.resources), train_num_items=tuple(args.train_items),
                          updates=args.updates, batch_size=args.batch_size, minibatch_size=args.minibatch_size,
                          device=args.device, seed=args.seed, checkpoint_dir=args.checkpoint_dir,
                          runs_dir=args.runs_dir, ranking_coefficient=args.ranking_coefficient,
                          ranking_states=args.ranking_states, ranking_pool_size=args.ranking_pool_size,
-                         ranking_repeats=args.ranking_repeats)
+                         ranking_repeats=args.ranking_repeats, performance_profile=args.performance_profile,
+                         feature_cache_gib=args.feature_cache_gib, cache_headroom_gib=args.cache_headroom_gib,
+                         feature_cache_batch_size=args.feature_cache_batch_size)
     model = ModelConfig(opportunity_weight_max=args.opportunity_weight_max,
                         reserve_weight_max=args.reserve_weight_max, opportunity_tokens=args.opportunity_tokens,
                         actor_edge_values=args.actor_edge_values,
@@ -368,5 +420,9 @@ def main(argv=None):
                         actor_feasible_attention=args.actor_feasible_attention,
                         actor_relation_chunk_size=args.actor_relation_chunk_size,
                         actor_relation_bandwidth=args.actor_relation_bandwidth,
-                        actor_similarity_bandwidth=args.actor_similarity_bandwidth)
+                        actor_similarity_bandwidth=args.actor_similarity_bandwidth,
+                        interaction_weight_max=args.interaction_weight_max,
+                        companion_weight_max=args.companion_weight_max,
+                        combination_initial_weight=args.combination_initial_weight,
+                        companion_scales=tuple(args.companion_scales), combination_chunk_size=args.combination_chunk_size)
     MKPTrainer(config, model).train(args.resume)

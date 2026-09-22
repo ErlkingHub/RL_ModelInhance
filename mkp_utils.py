@@ -10,6 +10,7 @@ import torch
 from mkp_config import CHECKPOINT_VERSION, CONTROLLER_VERSION, DECODER_VERSION, ModelConfig
 from mkp_env import MKPEnv
 from mkp_Model import MKPModel, WeakDecoder
+from mkp_basis import decoder_statistics
 
 
 def resolve_device(name):
@@ -58,8 +59,8 @@ def load_checkpoint(path, device, expected_m=None):
     # Checkpoints are local trusted training artifacts; loading still uses restricted unpickling.
     payload = torch.load(path, map_location="cpu", weights_only=True)
     if payload.get("checkpoint_version") != CHECKPOINT_VERSION:
-        raise ValueError("Incompatible checkpoint schema: controller v4 requires a fresh training run; "
-                         "v1/v2/v3 weights cannot be resumed as the new controller")
+        raise ValueError("Incompatible checkpoint schema: combination theta v5 requires a fresh training run; "
+                         "v1/v2/v3/v4 weights cannot be resumed as the new controller/decoder")
     if payload.get("controller_version") != CONTROLLER_VERSION:
         raise ValueError("Checkpoint's high-level controller differs from this implementation")
     if payload.get("decoder_version") != DECODER_VERSION:
@@ -85,14 +86,16 @@ def construct_solution(data, model=None, mode="learned_dynamic", stochastic=Fals
     if mode == "fixed":
         # The original density baseline has zero opportunity weights: avoid
         # charging its runtime for pairwise features it never uses.
-        decoder = WeakDecoder(replace(decoder.config, opportunity_weight_max=0, reserve_weight_max=0))
+        decoder = WeakDecoder(replace(decoder.config, opportunity_weight_max=0, reserve_weight_max=0,
+                                      interaction_weight_max=0, companion_weight_max=0))
     if model is not None:
         model.eval()
     theta = decoder.fixed_theta(env.state) if mode == "fixed" else None
     if mode == "learned_static":
         theta = model.actor(env.state)[0]
     sequences = []
-    theta_sum = torch.zeros(data[0].shape[0], 7, device=data[0].device)
+    theta_sum = torch.zeros(data[0].shape[0], 9, device=data[0].device)
+    decoder_sum = torch.zeros(data[0].shape[0], 4, device=data[0].device)
     theta_count = torch.zeros(data[0].shape[0], device=data[0].device)
     for _ in range(data[0].shape[1]):
         active = env.state.active
@@ -102,11 +105,9 @@ def construct_solution(data, model=None, mode="learned_dynamic", stochastic=Fals
             theta = model.actor(env.state)[0]
         policy = decoder(env.state, theta)
         actions = policy.choose(stochastic)
-        stats = torch.stack((theta.profit_exponent, theta.scarcity_exponent,
-                             theta.bottleneck_weight, theta.temperature,
-                             theta.resource_prices.std(-1, unbiased=False),
-                             theta.opportunity_weight, theta.reserve_weight), dim=-1)
+        stats = theta.statistics()
         theta_sum += stats * active[:, None]
+        decoder_sum += decoder_statistics(policy) * active[:, None]
         theta_count += active
         sequences.append(actions)
         env.step(actions)
@@ -116,4 +117,5 @@ def construct_solution(data, model=None, mode="learned_dynamic", stochastic=Fals
                 torch.empty(data[0].shape[0], 0, dtype=torch.long, device=data[0].device))
     return {"objective": env.objective, "selected": env.state.selected,
             "remaining": env.state.remaining, "sequence": sequence,
-            "theta_mean": theta_sum / theta_count.clamp_min(1)[:, None]}
+            "theta_mean": theta_sum / theta_count.clamp_min(1)[:, None],
+            "decoder_mean": decoder_sum / theta_count.clamp_min(1)[:, None]}

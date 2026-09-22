@@ -4,18 +4,23 @@ Ideas: variable/constraint graph (Gasse et al., 2019); attention for constructiv
 optimization (Kool et al., 2019). This is an MKP-specific implementation, not a
 reproduction of either paper. The actor never produces learned per-item logits.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 import math
 import torch
 from torch import nn
 from mkp_config import ModelConfig
 from mkp_env import MKPState
+from mkp_basis import CombinationControlHead, interaction_loads, companion_basis
+from mkp_performance import cached_features, prepare_state
 from mkp_attention import (POST_DIM, RESOURCE_POST_DIM, candidate_relations,
-                           PairRelationAttention, CriticalContrastPool,
+                           PairRelationAttention, CriticalContrastPool, CandidateRelations,
                            masked_softmax, safe_key_padding_mask)
 
 
 def state_features(state: MKPState, config: ModelConfig):
+    cached = cached_features(state, config)
+    if cached is not None:
+        return tuple(cached[key] for key in ("item", "resource", "edge", "global"))
     p, w, c, rem = (x.float() for x in
                     (state.profits, state.weights, state.capacities, state.remaining))
     n = p.shape[1]
@@ -141,7 +146,10 @@ class BipartiteEncoder(nn.Module):
         c = self.config
         relations = None
         if self.strategy and (c.actor_postdecision_features or c.actor_pair_attention or c.actor_contrast_pooling):
-            relations = candidate_relations(state, c)
+            cached = cached_features(state, c)
+            relations = (candidate_relations(state, c) if cached is None else
+                         CandidateRelations(*(cached["relation_" + key] for key in
+                                              ("pairs", "valid", "post", "resource_post"))))
         if self.strategy and c.actor_postdecision_features:
             item_f = torch.cat((item_f, relations.post), -1)
             edges = torch.cat((edges, relations.resource_post), -1)
@@ -176,11 +184,17 @@ class StrategyTheta:
     temperature: torch.Tensor
     opportunity_weight: torch.Tensor  # [B], penalty for lost feasible profit mass
     reserve_weight: torch.Tensor      # [B], smooth loss of future capacity margins
+    resource_interactions: torch.Tensor  # [B,M,M], symmetric; upper-triangle coefficients counted once
+    companion_weights: torch.Tensor      # [B,K], nonnegative fixed pair-basis coefficients
 
     def detach(self):
-        return StrategyTheta(*(x.detach() for x in (self.resource_prices, self.profit_exponent,
-                             self.scarcity_exponent, self.bottleneck_weight, self.temperature,
-                             self.opportunity_weight, self.reserve_weight)))
+        return StrategyTheta(*(getattr(self, field.name).detach() for field in fields(self)))
+
+    def statistics(self):
+        return torch.stack((self.profit_exponent, self.scarcity_exponent, self.bottleneck_weight,
+                            self.temperature, self.resource_prices.std(-1, unbiased=False),
+                            self.opportunity_weight, self.reserve_weight,
+                            self.resource_interactions.triu().sum((-1, -2)), self.companion_weights.sum(-1)), -1)
 
 
 class HighLevelController(nn.Module):
@@ -192,6 +206,7 @@ class HighLevelController(nn.Module):
         self.price_context = nn.Sequential(nn.Linear(3 * config.embed_dim, config.embed_dim), nn.GELU())
         self.price_head = nn.Linear(config.embed_dim, 1, bias=False)
         self.strategy_head = nn.Linear(config.embed_dim, 6)
+        self.combination_head = CombinationControlHead(config)
         # Auxiliary state supervision only. Its item outputs never enter decoder scores.
         self.feasibility_head = nn.Linear(config.embed_dim, 1)
         nn.init.zeros_(self.price_head.weight)
@@ -215,12 +230,14 @@ class HighLevelController(nn.Module):
             (resources, global_context, resources * global_context), -1))).squeeze(-1)
         prices = c.price_floor + (1 - c.price_floor) * m * price_logits.softmax(-1)
         controls = self.strategy_head(pooled).sigmoid()
+        interaction, companion = self.combination_head(resources, pooled)
         theta = StrategyTheta(
             prices,
             c.profit_exponent_min + (c.profit_exponent_max - c.profit_exponent_min) * controls[:, 0],
             c.scarcity_exponent_max * controls[:, 1], c.bottleneck_weight_max * controls[:, 2],
             c.temperature_min + (c.temperature_max - c.temperature_min) * controls[:, 3],
-            c.opportunity_weight_max * controls[:, 4], c.reserve_weight_max * controls[:, 5])
+            c.opportunity_weight_max * controls[:, 4], c.reserve_weight_max * controls[:, 5],
+            interaction, companion)
         return theta, self.feasibility_head(items).squeeze(-1)
 
 
@@ -230,9 +247,10 @@ class CandidatePolicy:
     No dense logits with -inf and no invalid-action rejection loop. Segment
     reductions support different candidate counts and already terminal rows.
     """
-    def __init__(self, owners, items, logits, batch_size):
+    def __init__(self, owners, items, logits, batch_size, score_terms=None):
         self.owners, self.items, self.logits = owners, items, logits
         self.batch_size = batch_size
+        self.score_terms = score_terms
         maxima = logits.new_full((batch_size,), -torch.inf)
         maxima = maxima.scatter_reduce(0, owners, logits, reduce="amax", include_self=True)
         centered = logits - maxima[owners]
@@ -277,6 +295,8 @@ class WeakDecoder:
               - kappa * max_j(w_ij / max(c_j, eps))
               - opportunity_weight * blocked_profit_mass_i
               - reserve_weight * smooth_margin_loss_i
+              - sum_{r<=s} interaction_rs * z_ir * z_is
+              + sum_k companion_weight_k * companion_basis_ik
     pi(i|s) = softmax(score_i / temperature) over feasible candidates.
     """
     def __init__(self, config: ModelConfig):
@@ -288,7 +308,9 @@ class WeakDecoder:
         return StrategyTheta(torch.ones(b, m, device=device), torch.ones(b, device=device),
                              torch.ones(b, device=device), torch.full((b,), 0.1, device=device),
                              torch.full((b,), 0.2, device=device),
-                             torch.zeros(b, device=device), torch.zeros(b, device=device))
+                             torch.zeros(b, device=device), torch.zeros(b, device=device),
+                             torch.zeros(b, m, m, device=device),
+                             torch.zeros(b, len(self.config.companion_scales), device=device))
 
     @torch.no_grad()
     def opportunity_features(self, state, owners, items):
@@ -324,6 +346,7 @@ class WeakDecoder:
 
     def __call__(self, state, theta):
         owners, items = state.feasible.nonzero(as_tuple=True)
+        cached = cached_features(state, self.config)
         eps = self.config.eps
         p, w, c, rem = (x.float() for x in
                         (state.profits, state.weights, state.capacities, state.remaining))
@@ -346,16 +369,31 @@ class WeakDecoder:
         scores = theta.profit_exponent[owners] * profit.clamp_min(eps).log() - log_cost
         scores = scores - theta.bottleneck_weight[owners] * bottleneck
         if self.config.opportunity_weight_max or self.config.reserve_weight_max:
-            blocked, reserve = self.opportunity_features(state, owners, items)
+            blocked, reserve = (self.opportunity_features(state, owners, items) if cached is None else
+                                (cached["blocked"][owners, items], cached["reserve"][owners, items]))
             scores = (scores - theta.opportunity_weight[owners] * blocked
                       - theta.reserve_weight[owners] * reserve)
-        return CandidatePolicy(owners, items, scores / theta.temperature[owners], p.shape[0])
+        base = scores
+        penalty, bonus = torch.zeros_like(scores), torch.zeros_like(scores)
+        if self.config.interaction_weight_max:
+            z = (interaction_loads(state, owners, items, eps) if cached is None else
+                 cached["interaction"][owners, items])
+            penalty = (theta.resource_interactions[owners].triu() * z[:, :, None] * z[:, None, :]).sum((-1, -2))
+        if self.config.companion_weight_max:
+            basis = (companion_basis(state, owners, items, self.config) if cached is None else
+                     cached["companion"][owners, items])
+            bonus = (theta.companion_weights[owners] * basis).sum(-1)
+        scores = base - penalty + bonus
+        return CandidatePolicy(owners, items, scores / theta.temperature[owners], p.shape[0],
+                               dict(base=base, interaction_penalty=penalty, companion_bonus=bonus, score=scores))
 
 
 class MKPModel(nn.Module):
     def __init__(self, config: ModelConfig | None = None):
         super().__init__()
         self.config = config or ModelConfig()
+        self.feature_config = self.config
+        self.reuse_state_features = False
         self.actor = HighLevelController(self.config)
         # Independent critic: actor changes cannot silently change the baseline representation.
         self.critic_encoder = BipartiteEncoder(self.config)
@@ -363,6 +401,8 @@ class MKPModel(nn.Module):
         self.decoder = WeakDecoder(self.config)
 
     def policy(self, state):
+        if self.reuse_state_features:
+            prepare_state(state, self.feature_config)
         theta, feasibility_logits = self.actor(state)
         return self.decoder(state, theta), theta, feasibility_logits
 

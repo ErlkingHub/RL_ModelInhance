@@ -120,7 +120,8 @@ class ConvergenceTests(unittest.TestCase):
 
             stats = {key: .1 for key in ("policy_loss", "value_loss", "constraint_aux_loss", "entropy",
                                         "approx_kl", "clip_fraction", "grad_norm", "explained_variance")}
-            stats.update(minibatches=1, kl_stopped=0)
+            stats.update(minibatches=1, kl_stopped=0, ppo_seconds=.1,
+                         feature_cache_gib=0., feature_cache_seconds=0.)
             with patch("mkp_Trainer.construct_solution", side_effect=fake_solution), \
                  patch("mkp_Trainer.collect_rollout", side_effect=fake_rollout), \
                  patch.object(MKPTrainer, "ppo_update", return_value=stats), \
@@ -132,9 +133,11 @@ class ConvergenceTests(unittest.TestCase):
                 log = (trainer.run_dir / "train.log").read_text()
                 self.assertIn("CONVERGENCE_FINAL", log)
                 self.assertIn("entropy=", log)
+                self.assertIn("SPEED |", log)
                 checkpoint = root / "checkpoints" / "mkp_M5_last.pt"
                 payload = torch.load(checkpoint, weights_only=True)
                 self.assertEqual(len(payload["diagnostics_history"]), 5)
+                self.assertEqual(payload["training_runtime"]["profile"], "reference")
                 self.assertEqual(training_diagnostics(payload, 5)["report_status"], "available")
                 config.updates = 8
                 resumed = MKPTrainer(config, model)
