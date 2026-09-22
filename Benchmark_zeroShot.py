@@ -133,6 +133,8 @@ def benchmark(config=None):
         models[m], payload = load_checkpoint(checkpoint, device, m)
         models[m].eval().requires_grad_(False)
         metadata[str(m)] = {"path": str(checkpoint.resolve()), "sha256": file_sha256(checkpoint),
+                            "training_version": payload.get("training_version", "ppo_only_legacy"),
+                            "ranking_config": {k: v for k, v in payload["train_config"].items() if k.startswith("ranking_")},
                             "update": payload["update"], "model_config": payload["model_config"],
                             "train_num_items": payload["train_config"]["train_num_items"],
                             "training_data_source": payload["training_data_source"],

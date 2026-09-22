@@ -177,9 +177,13 @@ class CandidatePolicy:
         total = logits.new_zeros(batch_size).scatter_add(0, owners, centered.exp())
         self.log_probs = centered - total[owners].log()
 
-    def choose(self, stochastic=False):
+    def choose(self, stochastic=False, gumbel=None):
         values = self.log_probs
-        if stochastic:
+        if gumbel is not None:
+            if not stochastic or gumbel.shape != values.shape or not torch.isfinite(gumbel).all():
+                raise ValueError("gumbel must be finite candidate-wise noise for stochastic selection")
+            values = values + gumbel
+        elif stochastic:
             uniform = torch.rand_like(values).clamp(1e-7, 1 - 1e-7)
             values = values - (-uniform.log()).log()
         maxima = values.new_full((self.batch_size,), -torch.inf)
@@ -225,7 +229,8 @@ class WeakDecoder:
                              torch.ones(b, device=device), torch.full((b,), 0.1, device=device),
                              torch.full((b,), 0.2, device=device))
 
-    def __call__(self, state, theta):
+    def scores(self, state, theta):
+        """Original fixed formula, before temperature; shared by PPO and ranking."""
         owners, items = state.feasible.nonzero(as_tuple=True)
         eps = self.config.eps
         p, w, c, rem = (x.float() for x in
@@ -248,7 +253,11 @@ class WeakDecoder:
         bottleneck = (candidate_w / rem[owners].clamp_min(eps)).amax(-1)
         scores = theta.profit_exponent[owners] * profit.clamp_min(eps).log() - log_cost
         scores = scores - theta.bottleneck_weight[owners] * bottleneck
-        return CandidatePolicy(owners, items, scores / theta.temperature[owners], p.shape[0])
+        return owners, items, scores
+
+    def __call__(self, state, theta):
+        owners, items, scores = self.scores(state, theta)
+        return CandidatePolicy(owners, items, scores / theta.temperature[owners], state.profits.shape[0])
 
 
 class MKPModel(nn.Module):

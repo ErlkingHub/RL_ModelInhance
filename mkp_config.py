@@ -1,10 +1,12 @@
 """All experiment defaults. Paths are relative to this project, not the shell cwd."""
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+import math
 
 ROOT = Path(__file__).resolve().parent
 CHECKPOINT_VERSION = 1
 DECODER_VERSION = "resource_price_density_v1"
+TRAINING_VERSION = "ppo_theta_counterfactual_v1"
 
 @dataclass
 class TrainConfig:
@@ -22,6 +24,22 @@ class TrainConfig:
     value_coefficient: float = 0.5
     entropy_coefficient: float = 0.01
     constraint_aux_coefficient: float = 0.05
+    # Training-only action preferences from legal theta probes and frozen continuations.
+    ranking_coefficient: float = 0.1
+    ranking_every: int = 10
+    ranking_states: int = 16
+    ranking_theta_candidates: int = 12  # includes the current controller theta
+    ranking_max_actions: int = 4
+    ranking_theta_std: float = 1.0
+    ranking_continuation: str = "greedy"
+    ranking_repeats: int = 4  # used only for sampled continuations
+    ranking_rollout_batch_size: int = 64
+    ranking_min_gap: float = 1e-5  # profit / total instance profit
+    ranking_se_multiplier: float = 2.0
+    ranking_return_scale: float = 1e-3  # pair confidence weight saturates here
+    ranking_score_scale: float = 0.1
+    ranking_target_kl: float = 0.03
+    ranking_audit: bool = True
     max_grad_norm: float = 1.0
     target_kl: float = 0.03
     validation_every: int = 25
@@ -39,7 +57,7 @@ class TrainConfig:
     deterministic: bool = True
     cpu_threads: int = 4
     runs_dir: Path = field(default_factory=lambda: ROOT / "runs")
-    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints")
+    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / TRAINING_VERSION)
 
     def __post_init__(self):
         counts = (self.updates, self.batch_size, self.minibatch_size, self.ppo_epochs,
@@ -66,6 +84,24 @@ class TrainConfig:
             raise ValueError("convergence_tolerance_pct must lie in (0, 100)")
         if self.convergence_min_evaluations < 2:
             raise ValueError("convergence_min_evaluations must be at least 2")
+        ranking_counts = (self.ranking_every, self.ranking_states, self.ranking_theta_candidates,
+                          self.ranking_max_actions, self.ranking_repeats, self.ranking_rollout_batch_size)
+        if any(not isinstance(x, int) or x < 1 for x in ranking_counts):
+            raise ValueError("Ranking counts and intervals must be positive integers")
+        if self.ranking_theta_candidates < 2 or self.ranking_max_actions < 2:
+            raise ValueError("Ranking requires at least two theta trials and action slots")
+        if self.ranking_continuation not in ("greedy", "sampled"):
+            raise ValueError("ranking_continuation must be greedy or sampled")
+        if self.ranking_continuation == "sampled" and self.ranking_repeats < 2:
+            raise ValueError("Sampled ranking requires at least two paired repeats")
+        for name in ("ranking_coefficient", "ranking_min_gap", "ranking_se_multiplier"):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
+                raise ValueError(f"{name} must be finite and nonnegative")
+        for name in ("ranking_theta_std", "ranking_return_scale", "ranking_score_scale", "ranking_target_kl"):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if self.ranking_coefficient and self.gamma != 1:
+            raise ValueError("Undiscounted counterfactual profit supervision requires gamma=1")
         self.runs_dir, self.checkpoint_dir = Path(self.runs_dir), Path(self.checkpoint_dir)
 
 
@@ -127,7 +163,7 @@ class BenchmarkConfig:
     dataset: Path = field(default_factory=lambda: ROOT / "MKP_dataset" / "Benchmarks_Chu.mat")
     num_resources: tuple[int, ...] = (5, 10)
     num_items: tuple[int, ...] = (100, 250, 500)
-    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints")
+    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / TRAINING_VERSION)
     results_dir: Path = field(default_factory=lambda: ROOT / "results")
     checkpoint_tag: str = "best"
     device: str = "auto"

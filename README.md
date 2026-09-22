@@ -4,6 +4,95 @@
 
 目标是在 `MKP_dataset/Benchmarks_Chu.mat` 上研究接近或低于 **0.1% gap** 的解。该目标需要实验验证，代码交付本身不代表达到该精度。默认训练与测试均由使用者运行。
 
+## PPO + 训练期 θ 候选反事实 rollout + 动作排序监督
+
+本次增强训练信号，保留当前 `resource_price_density_v1` 解码器、M+4 个 θ 输出、Actor/Critic 网络结构及推理流程。θ 候选只用于训练期发现不同动作；学习目标是**同一状态、同一冻结后续策略下的动作利润排序**，不回归候选 θ，不约束 θ 平滑，也不需要最优解、oracle 或 solver 标签。
+
+### 标签如何产生
+
+1. 每轮 PPO 仍在新生成的独立合成训练实例上正常采样。需要排序监督时，从这批轨迹**实际访问过的有效状态**随机抽样；复用访问状态，不另建 benchmark 状态库，也不读固定验证集生成标签。
+2. 在任何优化器更新之前复制并冻结当前模型，记其后续策略为 μ。保留当前控制器的 θ，另外交替生成局部 logit 扰动和覆盖合法范围的全局 θ 候选。资源价格满足下界和均值为 1，α/β/κ 满足原配置边界。温度保持当前值，因为温度不能改变当前 greedy 动作。
+3. 每个 θ 经过原解码器，取 greedy 动作。按动作去重，保留当前 θ 的动作，以及每个新动作首次出现的 θ 见证；默认最多评估 4 个不同动作。不同 θ 导致同一动作时只评估一次。
+4. 为每个动作复制源状态，真实更新 `remaining`、`selected`，由环境重新计算 `feasible`。随后每一步都用**同一个冻结模型**读取各自的真实后继状态、重新生成 θ，经原解码器选择动作，直至终止。候选 θ 只影响第一步，不在后续固定复用。
+5. 用 float64 终局收益减去源状态已经获得的收益，得到：
+
+```text
+Q^μ(s,a) = profit(a) + μ 在真实后继状态继续求解所得的利润
+         = branch_final_objective - source_selected_profit
+```
+
+默认 μ 是确定性 greedy 策略，每个不同动作续跑一次，其收益差可以通过保存的物品序列直接复核。可选 `sampled` 模式在每个动作上重复多次，使用按“源状态、重复编号、续跑步、物品编号”对应的共享 Gumbel 噪声；候选集合变化或分块大小变化不会把共享噪声错配给不同物品。该模式估计冻结随机策略下的期望收益，标签还需通过配对标准误过滤。
+
+收益只在**本次候选集合和本次冻结后续策略**下比较；“候选中更好”不等于全局最优。即使所有候选都诱导同一动作，或收益打平，也不会强造排序标签。
+
+### 排序损失与 PPO 的关系
+
+对同一状态下可靠的优劣动作对 `(a+, a-)`，令 `P = sum(instance profits)`：
+
+```text
+ΔQ = mean(Q^μ(s,a+) - Q^μ(s,a-)) / P
+保留条件：ΔQ > max(ranking_min_gap, ranking_se_multiplier × paired_SE)
+weight = min(ΔQ / ranking_return_scale, 1)
+L_pair = weight × softplus(-(score_θ(s,a+) - score_θ(s,a-)) / ranking_score_scale)
+L_rank = 先按状态平均有效 pair loss，再对有标签的状态求平均
+L_total = L_PPO_policy + c_v L_value + c_aux L_feasibility - c_H entropy + c_rank L_rank
+```
+
+这里的 `score_θ` 是原解码器**除温度之前**的评分，所以单独改变温度不能改善排序损失。梯度沿 `score → θ → controller → encoder` 传播，解码器没有新增参数。现有 v1 的输出权重是零初始化，第一次反传先更新输出头；输出权重非零后，排序梯度继续传入 encoder。
+
+反事实路径和候选 θ 不加入 PPO buffer，不改变 PPO 的动作概率 ratio、GAE 或 Critic 的回报目标。默认 PPO 的 `gamma=1` 与终局利润目标一致；开启本机制时会校验这一条件。排序标签在该次 PPO 更新开始前生成一次，在其多个 minibatch/epoch 中复用，更新结束后丢弃。
+
+除原 PPO KL 检查外，每个 minibatch 还检查抽样状态上**完整可行动作分布**相对于冻结策略的 KL，覆盖没有排序标签的竞争物品；超过阈值时停止本轮后续更新。这是更新过程的提前停止检查，不是严格的 KL 投影保证。
+
+### 默认预算与消融
+
+| 参数 | 默认值 | 含义 |
+| --- | --- | --- |
+| `ranking_coefficient` | `0.1` | 排序损失系数；设为 0 完全关闭候选生成、续跑和排序损失 |
+| `ranking_every` | `10` | update=1 及之后每 10 updates 生成一批标签 |
+| `ranking_states` | `16` | 最多抽取的实际访问状态数 |
+| `ranking_theta_candidates` | `12` | 每个状态的 θ 数量，含当前 θ |
+| `ranking_max_actions` | `4` | 去重后最多续跑的动作数 |
+| `ranking_theta_std` | `1.0` | 局部 θ logit 扰动尺度 |
+| `ranking_continuation` | `greedy` | 冻结后续策略，可选 `sampled` |
+| `ranking_repeats` | `4` | 仅 sampled 模式使用；greedy 只续跑一次 |
+| `ranking_rollout_batch_size` | `64` | 同时续跑的分支数上限 |
+| `ranking_min_gap` | `1e-5` | 以实例总利润归一化的最小收益差 |
+| `ranking_se_multiplier` | `2.0` | sampled 模式配对标准误阈值，不是最优性或严格置信保证 |
+| `ranking_return_scale` | `0.001` | 收益差权重达到 1 的归一化尺度 |
+| `ranking_score_scale` | `0.1` | 原始评分差的 logistic 尺度，与策略温度分开 |
+| `ranking_target_kl` | `0.03` | 排序状态上完整动作分布的 KL 提前停止阈值 |
+| `ranking_audit` | `True` | 保存可复核的状态、θ 见证、续跑序列和标签 |
+
+默认每次收集最多新增 `16×4=64` 条终局续跑；sampled 默认最多 `16×4×4=256` 条。动作去重可减少实际预算；候选评分还有至多 `16×12` 次 θ 解码。每条续跑至多 N 步，网络前向是主要额外成本，分块只限制并行显存，不截断终局收益。推理时没有这些分支或候选搜索。
+
+```powershell
+# 完整训练与评估由使用者执行；默认启用上述机制
+& 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' train_ConstrainedMKP.py
+& 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' Benchmark_zeroShot.py
+# 纯 PPO 对照，独立保存，避免覆盖新方法
+& 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' train_ConstrainedMKP.py --ranking-coefficient 0 --checkpoint-dir checkpoints/ppo_only
+# 较小的标签预算
+& 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' train_ConstrainedMKP.py --ranking-states 8 --ranking-theta-candidates 8 --ranking-max-actions 3
+# 可选的配对随机续跑
+& 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' train_ConstrainedMKP.py --ranking-continuation sampled --ranking-repeats 4
+```
+
+所有 `ranking_*` 参数在 CLI 中使用 `--ranking-...`；关闭审计用 `--no-ranking-audit`。排序随机数流由 seed/M/update 独立确定，不消耗 PPO、数据生成器或验证的随机数流。新训练与 Benchmark 默认使用 `checkpoints/ppo_theta_counterfactual_v1/`。模型和 decoder schema 没有变化，配置一致的现有 v1 权重仍兼容；checkpoint 额外记录训练机制和参数，Benchmark manifest 记录这些信息。跨目录续训时，`best.pt` 仍只在超过已保存的最佳验证收益时写出；可用 `--checkpoint-tag last` 显式评估最新模型。
+
+### 监督与收益如何复核
+
+- `metrics.csv` / `train.log` 增加有效状态数、θ 尝试数、去重动作数、续跑条数、有效 pair 数、候选相对当前 greedy 动作的收益提升、排序损失、pair accuracy、候选 regret、完整动作 KL 和收集耗时。
+- `ranking_candidate_regret` 是当前模型在**已评估候选动作中**所选动作，相对本批候选最好动作的归一化收益损失。`ranking_greedy_coverage` 报告当前完整 greedy 动作落在已评估集合中的比例；`ranking_greedy_regret` 只在这些被覆盖状态上计算，无覆盖时为 NaN。它们都不是 Chu gap。
+- `counterfactual_M*.jsonl` 保存源状态的 P/W/C、remaining/selected、源轨迹位置、冻结 Actor 哈希、θ 见证、首动作、每次续跑的完整物品序列、额外原始利润和接受的动作对。θ 见证仅用于验证“该动作能由合法 θ 经原 decoder 产生”，不进入损失。
+- 下列命令不训练、不调用 Chu；它重放保存的序列，检查 θ 合法性、动作见证、逐步可行性、终止性、原始利润和标签差值。哈希用于标识冻结策略；该检查不会凭哈希重建网络，因此不声称重新证明每一步恰由该网络选择。
+
+```powershell
+& 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' mkp_ranking.py --verify-audit runs/<时间戳>/counterfactual_M5.jsonl
+```
+
+泛化目标仍通过合成训练、固定合成验证和冻结的 N=100/250/500 测试来检验。排序收益差按实例总利润归一化，候选机制不依赖固定 N 或物品位置；本次没有扩大默认训练 N，也没有用 Chu 标签调参。请用相同训练 seed、预算、数据分布和单轨迹 greedy 协议比较纯 PPO 与加入排序监督的模型，实际泛化提升须由最终 objective/gap 支持。
+
 ## 运行
 
 在 PowerShell 中进入本项目，依次执行：
@@ -19,7 +108,7 @@
 # 自行运行：只训练一个资源维度
 & 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' train_ConstrainedMKP.py --resources 5 --updates 2000
 # 自行运行：从 last checkpoint 继续，updates 是累计更新次数目标
-& 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' train_ConstrainedMKP.py --resources 5 --resume checkpoints/mkp_M5_last.pt --updates 4000
+& 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' train_ConstrainedMKP.py --resources 5 --resume checkpoints/ppo_theta_counterfactual_v1/mkp_M5_last.pt --updates 4000
 # 可选：另报 128 条随机轨迹中的最佳解，不替代单轨迹 greedy 结果
 & 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' Benchmark_zeroShot.py --sample-rollouts 128
 ```
@@ -35,6 +124,7 @@
 | `mkp_env.py`              | float64 容量与收益记账，逐步选择，终止与可行候选集合      |
 | `mkp_Model.py`            | 二分图多头 Transformer、高层策略、固定解码器、独立 Critic |
 | `mkp_Trainer.py`          | 完整 episode 采样、GAE、PPO、合成验证、日志、checkpoint   |
+| `mkp_ranking.py`          | 训练期 θ 候选、动作去重、冻结反事实续跑、排序损失与证据复核 |
 | `train_ConstrainedMKP.py` | 简洁训练入口                                              |
 | `Benchmark_zeroShot.py`   | 冻结推理、独立解校验、CSV 与物品序列                      |
 | `mkp_utils.py`            | 复现设置、checkpoint 合约、共享构造过程                   |
@@ -43,8 +133,8 @@
 - `runs/<时间戳>/train.log`：每次更新的日志。
 - `runs/<时间戳>/metrics.csv`：收益、归一化 return、利用率、PPO 各项损失、归一化 entropy、KL、梯度范数、Critic explained variance、合成验证表现。
 - `runs/<时间戳>/config.json`：配置与运行环境。
-- `checkpoints/mkp_M5_best.pt`、`mkp_M10_best.pt`：按固定合成验证集的 greedy 归一化收益选择。
-- `checkpoints/mkp_M5_last.pt`、`mkp_M10_last.pt`：最近一次保存的模型，包含优化器和 RNG 状态；默认每 100 次更新、产生新 best 及训练结束时保存。
+- `checkpoints/ppo_theta_counterfactual_v1/mkp_M5_best.pt`、同目录的 `mkp_M10_best.pt`：按固定合成验证集的 greedy 归一化收益选择。
+- `checkpoints/ppo_theta_counterfactual_v1/mkp_M5_last.pt`、同目录的 `mkp_M10_last.pt`：最近一次保存的模型，包含优化器和 RNG 状态；默认每 100 次更新、产生新 best 及训练结束时保存。
 - `results/<时间戳>/instances.csv`：逐实例、逐方法报告。
 - `results/<时间戳>/summary.csv`：每种方法按 M/N 分组及总体报告。
 - `results/<时间戳>/solutions.jsonl`：零基索引物品选择顺序，可独立复核。
@@ -54,7 +144,7 @@
 
 ## 收敛诊断与训练曲线
 
-直接按上面的两条命令运行训练和 Benchmark 即可。`TrainConfig.updates=8000` 仍是每个 M 的完整训练预算；诊断不提前停止训练。每个 M 训练结束后自动生成：
+直接按上面的两条命令运行训练和 Benchmark 即可。当前代码的 `TrainConfig.updates=2000` 是每个 M 的默认训练预算，可用 `--updates 8000` 等显式覆盖；诊断不提前停止训练。每个 M 训练结束后自动生成：
 
 - `runs/<时间戳>/convergence_M5.json`、`convergence_M10.json`：最终收敛判定及阈值。
 - `runs/<时间戳>/plots/training_M5.png`、`training_M10.png`，以及同名 SVG：12 个子图，包括固定验证收益、训练 return、归一化 policy entropy、policy/value/辅助损失、approx KL、clip fraction、梯度范数、explained variance、容量利用率、KL 提前停止频率。浅色为原始数据，深色为最近 100 updates 的均值；验证曲线不平滑。
@@ -193,6 +283,10 @@ pi_i    = softmax(score_i / temperature)，只在可行候选集合中归一化
 ## 交付验证
 
 `tests/test_contracts.py` 只检查小张量上的候选概率、固定公式、约束拒绝、终止/GAE、排列等变性、高层梯度、checkpoint 往返及独立解校验；不含优化器更新、训练 episode 或 Chu 推理。训练收敛性、实际 GPU 内存/速度和最终 gap 需在正式实验中验证。
+
+新增 `tests/test_theta_ranking.py` 检查合法 θ、动作去重、真实后继状态、冻结与随机流隔离、配对续跑、收益/标准误过滤、温度无关排序损失、encoder 梯度、完整动作 KL、证据重放、CLI、checkpoint 元数据与续训调度。使用可手算的 A/B 案例验证“选择 A 剩余收益为 100、选择 B 后续得到 160”，但不把它当作模型已学会或 Chu gap 已改善的证据。PPO 接线测试将优化器 step 替换为空操作；编排测试使用模拟更新，没有运行完整训练或正式评估。
+
+本次 `python -m unittest discover -s tests -v` 共 **38 项通过**，包括 CUDA 确定性反传。该结果证明上述接口与小实例合约通过检查，不代表训练收敛或真实 gap 改善。
 
 
 ## 全流程如下：
