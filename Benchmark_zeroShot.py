@@ -139,6 +139,7 @@ def benchmark(config=None):
                             "decoder_version": payload["decoder_version"],
                             "update": payload["update"], "model_config": payload["model_config"],
                             "train_num_items": payload["train_config"]["train_num_items"],
+                            "ranking_protocol": payload.get("ranking_protocol", "score_pairs_v1"),
                             "training_data_source": payload["training_data_source"],
                             "training_diagnostics": training_diagnostics(payload, m)}
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")

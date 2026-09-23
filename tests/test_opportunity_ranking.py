@@ -38,7 +38,7 @@ class OpportunityTests(unittest.TestCase):
         torch.manual_seed(41)
         torch.set_num_threads(2)
         self.config = ModelConfig(embed_dim=16, num_heads=4, num_layers=1)
-        self.train = TrainConfig(ranking_states=2, ranking_pool_size=4, ranking_repeats=2,
+        self.train = TrainConfig(ranking_mode="score_pairs", ranking_states=2, ranking_pool_size=4, ranking_repeats=2,
                                  ppo_epochs=1, minibatch_size=4, device="cpu")
 
     def test_similar_items_flip_towards_preserved_future_item(self):

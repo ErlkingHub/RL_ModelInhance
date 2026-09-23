@@ -26,11 +26,16 @@ class TrainConfig:
     constraint_aux_coefficient: float = 0.05
     max_grad_norm: float = 1.0
     target_kl: float = 0.03
-    # Training-only paired continuations under the frozen pre-update policy.
+    # Training-only theta-induced actions under the frozen pre-update policy.
+    ranking_mode: str = "theta"  # score_pairs retains the previous supervision for ablations
     ranking_coefficient: float = 0.1
     ranking_states: int = 16
     ranking_pool_size: int = 64
-    ranking_candidates: int = 8
+    ranking_candidates: int = 8  # only used by score_pairs
+    ranking_theta_candidates: int = 8  # includes current theta; 4 local + 3 broad proposals
+    ranking_theta_local_scale: float = 1.0
+    ranking_max_actions: int = 4  # deduplicate, then cap before observing returns
+    ranking_audit_every: int = 100  # first update and each interval; 0 disables snapshots
     ranking_repeats: int = 4
     ranking_minibatch_size: int = 8
     ranking_min_gap: float = 0.001
@@ -91,6 +96,14 @@ class TrainConfig:
             raise ValueError("convergence_min_evaluations must be at least 2")
         if min(self.ranking_states, self.ranking_pool_size, self.ranking_minibatch_size) < 1:
             raise ValueError("Ranking batch sizes must be positive")
+        if self.ranking_mode not in ("theta", "score_pairs"):
+            raise ValueError("ranking_mode must be theta or score_pairs")
+        if self.ranking_theta_candidates < 2 or self.ranking_max_actions < 2:
+            raise ValueError("Theta ranking needs at least two proposals and two action slots")
+        if not math.isfinite(self.ranking_theta_local_scale) or self.ranking_theta_local_scale < 0:
+            raise ValueError("Theta perturbation scale must be finite and nonnegative")
+        if self.ranking_audit_every < 0:
+            raise ValueError("ranking_audit_every must be nonnegative")
         if self.ranking_pool_size < self.ranking_states or self.ranking_candidates < 2 or self.ranking_repeats < 2:
             raise ValueError("Ranking needs pool >= states, candidates >= 2 and repeats >= 2")
         if not (self.ranking_coefficient >= 0 and self.ranking_min_gap >= 0

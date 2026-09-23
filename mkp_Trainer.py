@@ -19,7 +19,7 @@ from mkp_data import synthetic_batch
 from mkp_env import MKPEnv, MKPState
 from mkp_Model import MKPModel
 from mkp_basis import COMBINATION_METRICS, decoder_statistics
-from mkp_ranking import collect_ranking_batch, ranking_objective, ranking_kl
+from mkp_ranking import collect_ranking_batch, ranking_objective, ranking_kl, THETA_METRICS, ranking_protocol
 from mkp_performance import (GIB, PERFORMANCE_FIELDS, configure_training_runtime,
                              build_rollout_cache, prepare_state)
 from mkp_diagnostics import convergence_report, plot_training, prepare_plotting
@@ -105,20 +105,26 @@ class MKPTrainer:
                         "ranking_standard_error", "ranking_label_seconds", "ranking_loss",
                         "ranking_accuracy", "ranking_kl", "ranking_minibatches"]
         self.fields += list(COMBINATION_METRICS)
+        self.fields += list(THETA_METRICS)
         self.fields += list(PERFORMANCE_FIELDS)
         with (self.run_dir / "metrics.csv").open("w", newline="", encoding="utf-8") as f:
             csv.DictWriter(f, fieldnames=self.fields).writeheader()
         write_json(self.run_dir / "config.json", {
             "train": config_dict(self.config), "model": config_dict(self.model_config),
             "generator": config_dict(self.generator_config), "torch": str(torch.__version__),
-            "device": str(self.device), "training_data_source": "synthetic_only"})
+            "device": str(self.device), "training_data_source": "synthetic_only",
+            "ranking_protocol": ranking_protocol(self.config)})
 
     def ppo_update(self, model, optimizer, data, rollout, update=0):
         c = self.config
         # No parameter update has occurred since collection: this is the frozen
         # behavior policy. Branches never enter the PPO buffer or critic targets.
+        audit_path = None
+        if (c.ranking_mode == "theta" and c.ranking_audit_every and hasattr(self, "run_dir")
+                and (update == 1 or update % c.ranking_audit_every == 0)):
+            audit_path = self.run_dir / "ranking_audit" / f"M{data[2].shape[-1]}_update{update:06d}.pt"
         ranking, ranking_stats = collect_ranking_batch(model, data, rollout, c,
-            seed=c.seed + 1000003 * update + data[2].shape[-1])
+            seed=c.seed + 1000003 * update + data[2].shape[-1], audit_path=audit_path)
         advantages, returns = generalized_advantage(rollout["rewards"], rollout["values"],
             rollout["dones"], rollout["active"], c.gamma, c.gae_lambda)
         times, batches = rollout["active"].nonzero(as_tuple=True)
@@ -235,6 +241,9 @@ class MKPTrainer:
             if saved["generator_config"] != config_dict(self.generator_config):
                 raise ValueError("Resume generator config differs")
             old = saved["train_config"]
+            if old.get("ranking_mode", "score_pairs") != c.ranking_mode:
+                self.logger.info("RANKING_PROTOCOL_CHANGE | resume %s -> %s; model/decoder weights remain compatible",
+                                 old.get("ranking_mode", "score_pairs"), c.ranking_mode)
             for key in ("train_num_items", "validation_seed", "validation_instances_per_shape", "seed"):
                 if old[key] != config_dict(c)[key]:
                     raise ValueError(f"Resume requires unchanged {key}")
@@ -252,6 +261,9 @@ class MKPTrainer:
         runtime = configure_training_runtime(model, c, self.device)
         write_json(self.run_dir / f"runtime_M{m}.json", runtime)
         self.logger.info("M=%d RUNTIME | %s", m, runtime)
+        self.logger.info("M=%d RANKING_PROTOCOL | %s | theta_candidates=%d max_actions=%d repeats=%d audit_every=%d",
+                         m, ranking_protocol(c), c.ranking_theta_candidates, c.ranking_max_actions,
+                         c.ranking_repeats, c.ranking_audit_every)
         # Fixed held-out synthetic validation has an independent RNG and only training N shapes.
         vrng = np.random.default_rng(c.validation_seed + m)
         validation = [synthetic_batch(c.validation_instances_per_shape, n, m, self.generator_config,
@@ -319,6 +331,15 @@ class MKPTrainer:
                              stats.get("ranking_loss", 0.), stats.get("ranking_accuracy", 0.),
                              stats.get("ranking_abs_return_gap", 0.), stats.get("ranking_standard_error", 0.),
                              stats.get("ranking_kl", 0.), stats.get("ranking_label_seconds", 0.))
+            self.logger.info("M=%d update=%d THETA_ACTIONS | states=%d theta_evaluations=%d unique_actions=%d "
+                             "actions_per_state=%.2f no_alternative=%d improved_pairs=%d improved_states=%d "
+                             "mean_normalized_gain=%.6f mean_raw_profit_gain=%.4f branches=%d",
+                             m, update, stats.get("ranking_states_labeled", 0),
+                             stats.get("ranking_theta_evaluations", 0), stats.get("ranking_unique_actions", 0),
+                             stats.get("ranking_action_diversity", 0.), stats.get("ranking_no_alternative", 0),
+                             stats.get("ranking_improved_pairs", 0), stats.get("ranking_improved_states", 0),
+                             stats.get("ranking_improvement_mean", 0.), stats.get("ranking_raw_improvement_mean", 0.),
+                             stats.get("ranking_rollout_branches", 0))
             self.logger.info("M=%d update=%d SPEED | rollout=%.2fs labels=%.2fs PPO=%.2fs "
                              "cache=%.3fGiB build=%.2fs peak_allocated=%.2fGiB peak_reserved=%.2fGiB",
                              m, update, stats["rollout_seconds"], stats.get("ranking_label_seconds", 0.),
@@ -335,7 +356,7 @@ class MKPTrainer:
                 previous_plateau = plateau
             if improved or update % c.checkpoint_every == 0 or update == c.updates:
                 payload = {"checkpoint_version": CHECKPOINT_VERSION, "decoder_version": DECODER_VERSION,
-                           "controller_version": CONTROLLER_VERSION,
+                           "controller_version": CONTROLLER_VERSION, "ranking_protocol": ranking_protocol(c),
                            "model_config": config_dict(self.model_config), "train_config": config_dict(c),
                            "generator_config": config_dict(self.generator_config), "num_resources": m,
                            "training_data_source": "synthetic_only", "update": update,
@@ -382,6 +403,11 @@ def main(argv=None):
     parser.add_argument("--checkpoint-dir", type=Path, default=defaults.checkpoint_dir)
     parser.add_argument("--runs-dir", type=Path, default=defaults.runs_dir)
     parser.add_argument("--ranking-coefficient", type=float, default=defaults.ranking_coefficient)
+    parser.add_argument("--ranking-mode", choices=("theta", "score_pairs"), default=defaults.ranking_mode)
+    parser.add_argument("--ranking-theta-candidates", type=int, default=defaults.ranking_theta_candidates)
+    parser.add_argument("--ranking-theta-local-scale", type=float, default=defaults.ranking_theta_local_scale)
+    parser.add_argument("--ranking-max-actions", type=int, default=defaults.ranking_max_actions)
+    parser.add_argument("--ranking-audit-every", type=int, default=defaults.ranking_audit_every)
     parser.add_argument("--ranking-states", type=int, default=defaults.ranking_states)
     parser.add_argument("--ranking-pool-size", type=int, default=defaults.ranking_pool_size)
     parser.add_argument("--ranking-repeats", type=int, default=defaults.ranking_repeats)
@@ -409,6 +435,9 @@ def main(argv=None):
                          runs_dir=args.runs_dir, ranking_coefficient=args.ranking_coefficient,
                          ranking_states=args.ranking_states, ranking_pool_size=args.ranking_pool_size,
                          ranking_repeats=args.ranking_repeats, performance_profile=args.performance_profile,
+                         ranking_mode=args.ranking_mode, ranking_theta_candidates=args.ranking_theta_candidates,
+                         ranking_theta_local_scale=args.ranking_theta_local_scale,
+                         ranking_max_actions=args.ranking_max_actions, ranking_audit_every=args.ranking_audit_every,
                          feature_cache_gib=args.feature_cache_gib, cache_headroom_gib=args.cache_headroom_gib,
                          feature_cache_batch_size=args.feature_cache_batch_size)
     model = ModelConfig(opportunity_weight_max=args.opportunity_weight_max,
