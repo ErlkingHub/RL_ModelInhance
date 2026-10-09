@@ -102,8 +102,11 @@ class MKPTrainer:
                        "minibatches", "kl_stopped", "validation_return", "validation_improvement_pct",
                        "best_validation_return", "elapsed_seconds"]
         self.fields += ["ranking_proposed", "ranking_pairs", "ranking_abs_return_gap",
-                        "ranking_standard_error", "ranking_label_seconds", "ranking_loss",
-                        "ranking_accuracy", "ranking_kl", "ranking_minibatches"]
+                        "ranking_standard_error", "ranking_target_offset", "ranking_label_seconds", "ranking_loss",
+                        "ranking_accuracy", "ranking_kl", "ranking_minibatches",
+                        "ranking_non_equal", "ranking_nonfinite", "ranking_gap_below_1e_5",
+                        "ranking_gap_below_1e_4", "ranking_gap_below_0_001",
+                        "ranking_gap_p10", "ranking_gap_p50", "ranking_gap_p90"]
         self.fields += list(COMBINATION_METRICS)
         self.fields += list(PERFORMANCE_FIELDS)
         with (self.run_dir / "metrics.csv").open("w", newline="", encoding="utf-8") as f:
@@ -314,11 +317,18 @@ class MKPTrainer:
                              "penalty=%.5f bonus=%.5f abs_delta=%.5f margin_ratio=%.5f",
                              m, update, *(row.get(key, 0.) for key in COMBINATION_METRICS))
             self.logger.info("M=%d update=%d RANKING | accepted=%d/%d loss=%.5f accuracy=%.4f "
-                             "return_gap=%.6f SE=%.6f KL=%.5f label_seconds=%.2f",
+                             "return_gap=%.6f SE=%.6f target_offset=%.6f KL=%.5f label_seconds=%.2f",
                              m, update, stats.get("ranking_pairs", 0), stats.get("ranking_proposed", 0),
                              stats.get("ranking_loss", 0.), stats.get("ranking_accuracy", 0.),
                              stats.get("ranking_abs_return_gap", 0.), stats.get("ranking_standard_error", 0.),
-                             stats.get("ranking_kl", 0.), stats.get("ranking_label_seconds", 0.))
+                             stats.get("ranking_target_offset", 0.), stats.get("ranking_kl", 0.),
+                             stats.get("ranking_label_seconds", 0.))
+            self.logger.info("M=%d update=%d RANKING_GAPS | non_equal=%d nonfinite=%d "
+                             "below_1e-5=%d below_1e-4=%d below_0.001=%d p10=%.8g p50=%.8g p90=%.8g",
+                             m, update, stats.get("ranking_non_equal", 0), stats.get("ranking_nonfinite", 0),
+                             stats.get("ranking_gap_below_1e_5", 0), stats.get("ranking_gap_below_1e_4", 0),
+                             stats.get("ranking_gap_below_0_001", 0), stats.get("ranking_gap_p10", 0.),
+                             stats.get("ranking_gap_p50", 0.), stats.get("ranking_gap_p90", 0.))
             self.logger.info("M=%d update=%d SPEED | rollout=%.2fs labels=%.2fs PPO=%.2fs "
                              "cache=%.3fGiB build=%.2fs peak_allocated=%.2fGiB peak_reserved=%.2fGiB",
                              m, update, stats["rollout_seconds"], stats.get("ranking_label_seconds", 0.),
@@ -385,6 +395,10 @@ def main(argv=None):
     parser.add_argument("--ranking-states", type=int, default=defaults.ranking_states)
     parser.add_argument("--ranking-pool-size", type=int, default=defaults.ranking_pool_size)
     parser.add_argument("--ranking-repeats", type=int, default=defaults.ranking_repeats)
+    parser.add_argument("--ranking-greedy-weight", type=float, default=defaults.ranking_greedy_weight)
+    parser.add_argument("--ranking-equality-tolerance", type=float,
+                        default=defaults.ranking_equality_tolerance)
+    parser.add_argument("--ranking-min-gap", type=float, default=defaults.ranking_min_gap)
     parser.add_argument("--opportunity-weight-max", type=float, default=model_defaults.opportunity_weight_max)
     parser.add_argument("--reserve-weight-max", type=float, default=model_defaults.reserve_weight_max)
     parser.add_argument("--opportunity-tokens", type=int, default=model_defaults.opportunity_tokens)
@@ -408,7 +422,11 @@ def main(argv=None):
                          device=args.device, seed=args.seed, checkpoint_dir=args.checkpoint_dir,
                          runs_dir=args.runs_dir, ranking_coefficient=args.ranking_coefficient,
                          ranking_states=args.ranking_states, ranking_pool_size=args.ranking_pool_size,
-                         ranking_repeats=args.ranking_repeats, performance_profile=args.performance_profile,
+                         ranking_repeats=args.ranking_repeats,
+                         ranking_greedy_weight=args.ranking_greedy_weight,
+                         ranking_equality_tolerance=args.ranking_equality_tolerance,
+                         ranking_min_gap=args.ranking_min_gap,
+                         performance_profile=args.performance_profile,
                          feature_cache_gib=args.feature_cache_gib, cache_headroom_gib=args.cache_headroom_gib,
                          feature_cache_batch_size=args.feature_cache_batch_size)
     model = ModelConfig(opportunity_weight_max=args.opportunity_weight_max,

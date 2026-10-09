@@ -31,13 +31,16 @@ class TrainConfig:
     ranking_states: int = 16
     ranking_pool_size: int = 64
     ranking_candidates: int = 8
-    ranking_repeats: int = 4
+    ranking_repeats: int = 1  # Used only when ranking_greedy_weight < 1.
     ranking_minibatch_size: int = 8
-    ranking_min_gap: float = 0.001
+    # Normalized-return equality tolerance; independent of the training filter.
+    ranking_equality_tolerance: float = 1e-12
+    # Keep all numerically distinct labels until their gap distribution is measured.
+    ranking_min_gap: float = 0.0
     ranking_se_multiplier: float = 1.0
     ranking_return_scale: float = 0.02
     ranking_score_scale: float = 0.2
-    ranking_greedy_weight: float = 0.5
+    ranking_greedy_weight: float = 1.0
     validation_every: int = 25
     validation_instances_per_shape: int = 64
     checkpoint_every: int = 100
@@ -91,13 +94,16 @@ class TrainConfig:
             raise ValueError("convergence_min_evaluations must be at least 2")
         if min(self.ranking_states, self.ranking_pool_size, self.ranking_minibatch_size) < 1:
             raise ValueError("Ranking batch sizes must be positive")
-        if self.ranking_pool_size < self.ranking_states or self.ranking_candidates < 2 or self.ranking_repeats < 2:
-            raise ValueError("Ranking needs pool >= states, candidates >= 2 and repeats >= 2")
+        if (self.ranking_pool_size < self.ranking_states or self.ranking_candidates < 2
+                or self.ranking_repeats < (1 if self.ranking_greedy_weight == 1 else 2)):
+            raise ValueError("Ranking needs pool >= states, candidates >= 2 and stochastic repeats >= 2")
         if not (self.ranking_coefficient >= 0 and self.ranking_min_gap >= 0
+                and self.ranking_equality_tolerance >= 0
                 and self.ranking_se_multiplier >= 0 and self.ranking_return_scale > 0
                 and self.ranking_score_scale > 0 and 0 <= self.ranking_greedy_weight <= 1):
             raise ValueError("Invalid ranking loss settings")
         if not all(math.isfinite(x) for x in (self.ranking_coefficient, self.ranking_min_gap,
+                self.ranking_equality_tolerance, self.ranking_greedy_weight,
                 self.ranking_se_multiplier, self.ranking_return_scale, self.ranking_score_scale)):
             raise ValueError("Ranking loss settings must be finite")
         self.runs_dir, self.checkpoint_dir = Path(self.runs_dir), Path(self.checkpoint_dir)

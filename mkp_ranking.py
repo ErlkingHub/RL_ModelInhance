@@ -51,24 +51,34 @@ def paired_terminal_returns(model, state, left, right, repeats, stochastic, gene
         env.step(actions)
     if env.state.active.any():
         raise RuntimeError("Counterfactual continuation exceeded N steps")
-    return (env.objective / env.state.profits.sum(-1)).float().reshape(b, repeats, 2)
+    # Preserve float64 terminal accounting through pair subtraction.
+    return (env.objective / env.state.profits.sum(-1)).reshape(b, repeats, 2)
 
 
 def return_targets(greedy, sampled, config):
+    greedy = greedy.double()
     greedy_delta = greedy[:, 0, 0] - greedy[:, 0, 1]
-    differences = sampled[:, :, 0] - sampled[:, :, 1]
-    sample_delta = differences.mean(-1)
-    sample_se = differences.std(-1, unbiased=True) / math.sqrt(differences.shape[1])
     weight = config.ranking_greedy_weight
-    delta = weight * greedy_delta + (1 - weight) * sample_delta
-    se = (1 - weight) * sample_se
-    threshold = torch.maximum(torch.full_like(delta, config.ranking_min_gap),
+    if weight == 1:
+        delta = greedy_delta
+        se = torch.zeros_like(delta)
+    else:
+        if sampled is None:
+            raise ValueError("Stochastic returns are required when greedy weight is below 1")
+        sampled = sampled.double()
+        differences = sampled[:, :, 0] - sampled[:, :, 1]
+        sample_delta = differences.mean(-1)
+        sample_se = differences.std(-1, unbiased=True) / math.sqrt(differences.shape[1])
+        delta = weight * greedy_delta + (1 - weight) * sample_delta
+        se = (1 - weight) * sample_se
+    threshold = torch.maximum(torch.full_like(delta, max(config.ranking_equality_tolerance,
+                                                         config.ranking_min_gap)),
                               config.ranking_se_multiplier * se)
-    keep = delta.abs() > threshold
+    keep = torch.isfinite(delta) & torch.isfinite(se) & (delta.abs() > threshold)
     if 0 < weight < 1:
         # Avoid teaching confidently conflicting greedy/stochastic orderings.
         conflict = ((greedy_delta * sample_delta < 0)
-                    & (greedy_delta.abs() > config.ranking_min_gap)
+                    & (greedy_delta.abs() > config.ranking_equality_tolerance)
                     & (sample_delta.abs() > config.ranking_se_multiplier * sample_se))
         keep &= ~conflict
     return delta, se, keep
@@ -78,7 +88,11 @@ def return_targets(greedy, sampled, config):
 def collect_ranking_batch(model, data, rollout, config, seed):
     """Bounded pool, top-score similar peers, then 3/4 hard + 1/4 random states."""
     metrics = dict(ranking_proposed=0, ranking_pairs=0, ranking_abs_return_gap=0.,
-                   ranking_standard_error=0., ranking_label_seconds=0.)
+                   ranking_standard_error=0., ranking_label_seconds=0., ranking_target_offset=0.,
+                   ranking_non_equal=0, ranking_nonfinite=0,
+                   ranking_gap_below_1e_5=0, ranking_gap_below_1e_4=0,
+                   ranking_gap_below_0_001=0,
+                   ranking_gap_p10=0., ranking_gap_p50=0., ranking_gap_p90=0.)
     if config.ranking_coefficient == 0:
         return None, metrics
     import time
@@ -131,14 +145,31 @@ def collect_ranking_batch(model, data, rollout, config, seed):
         state, left, right, old = state.index(chosen), left[chosen], right[chosen], old[chosen]
         metrics["ranking_proposed"] = count
         greedy = paired_terminal_returns(model, state, left, right, 1, False)
-        sampled = paired_terminal_returns(model, state, left, right, config.ranking_repeats, True, generator)
+        sampled = (paired_terminal_returns(model, state, left, right, config.ranking_repeats,
+                                           True, generator) if config.ranking_greedy_weight < 1 else None)
         delta, se, keep = return_targets(greedy, sampled, config)
+        finite = torch.isfinite(delta)
+        metrics["ranking_nonfinite"] = (~finite).sum().item()
+        gaps = delta[finite].abs()
+        gaps = gaps[gaps > config.ranking_equality_tolerance]
+        metrics["ranking_non_equal"] = gaps.numel()
+        if gaps.numel():
+            metrics["ranking_gap_below_1e_5"] = (gaps < 1e-5).sum().item()
+            metrics["ranking_gap_below_1e_4"] = (gaps < 1e-4).sum().item()
+            metrics["ranking_gap_below_0_001"] = (gaps < 0.001).sum().item()
+            q = torch.quantile(gaps, torch.tensor([0.1, 0.5, 0.9], device=device,
+                                                  dtype=gaps.dtype))
+            (metrics["ranking_gap_p10"], metrics["ranking_gap_p50"],
+             metrics["ranking_gap_p90"]) = q.tolist()
         accepted = keep.nonzero(as_tuple=True)[0]
         metrics["ranking_pairs"] = accepted.numel()
         if accepted.numel():
             metrics["ranking_abs_return_gap"] = delta[accepted].abs().mean().item()
             metrics["ranking_standard_error"] = se[accepted].mean().item()
-            batch = RankingBatch(state, left, right, delta, se, old).index(accepted)
+            metrics["ranking_target_offset"] = (torch.sigmoid(
+                delta[accepted] / config.ranking_return_scale) - 0.5).abs().mean().item()
+            # Only the training targets use float32; filtering used float64.
+            batch = RankingBatch(state, left, right, delta.float(), se.float(), old).index(accepted)
         else:
             batch = None
         metrics["ranking_label_seconds"] = time.perf_counter() - began

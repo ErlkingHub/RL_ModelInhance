@@ -113,14 +113,28 @@ class OpportunityTests(unittest.TestCase):
         before = state.remaining.clone(), state.selected.clone()
         model = MKPModel(self.config).eval()
         result = paired_terminal_returns(model, state, torch.tensor([0]), torch.tensor([1]), 1, False)
-        torch.testing.assert_close(result, torch.tensor([[[10.05 / 25.05, 15 / 25.05]]]))
+        torch.testing.assert_close(result, torch.tensor([[[10.05 / 25.05, 15 / 25.05]]], dtype=torch.float64))
         torch.testing.assert_close(state.remaining, before[0])
         torch.testing.assert_close(state.selected, before[1])
         # A branch from an already-partial state retains its selected profit.
         env = MKPEnv.from_state(state)
         env.step(torch.tensor([2]))
         result = paired_terminal_returns(model, env.state, torch.tensor([1]), torch.tensor([1]), 1, False)
-        torch.testing.assert_close(result, torch.tensor([[[15 / 25.05, 15 / 25.05]]]))
+        torch.testing.assert_close(result, torch.tensor([[[15 / 25.05, 15 / 25.05]]], dtype=torch.float64))
+
+    def test_float64_gap_survives_float32_conversion(self):
+        state = MKPEnv(torch.tensor([[1., 1. + 1e-8]], dtype=torch.float64),
+                       torch.ones(1, 2, 1, dtype=torch.float64),
+                       torch.ones(1, 1, dtype=torch.float64)).state
+        result = paired_terminal_returns(MKPModel(self.config).eval(), state,
+                                         torch.tensor([0]), torch.tensor([1]), 1, False)
+        self.assertEqual(result.dtype, torch.float64)
+        self.assertEqual((result.float()[0, 0, 0] - result.float()[0, 0, 1]).item(), 0.)
+        delta, se, keep = return_targets(result, None, self.train)
+        self.assertTrue(keep.item())
+        self.assertLess(delta.item(), 0.)
+        self.assertGreater(abs(delta.float().item()), 0.)
+        self.assertEqual(se.item(), 0.)
 
     def test_shared_item_noise_identical_actions_identical_returns(self):
         state = MKPEnv(torch.tensor([[3., 2., 4., 3., 2.]]),
@@ -135,13 +149,39 @@ class OpportunityTests(unittest.TestCase):
     def test_target_filters_noise_small_gaps_and_conflicts(self):
         greedy = torch.tensor([[[.5, .5]], [[.8, .4]], [[.8, .4]]])
         sampled = torch.tensor([[[.5, .5], [.5, .5]], [[.8, .4], [.8, .4]], [[.4, .8], [.4, .8]]])
-        delta, se, keep = return_targets(greedy, sampled, self.train)
+        mixed = replace(self.train, ranking_greedy_weight=.5, ranking_min_gap=.001)
+        delta, se, keep = return_targets(greedy, sampled, mixed)
         self.assertEqual(keep.tolist(), [False, True, False])
         self.assertEqual(se.tolist(), [0., 0., 0.])
         self.assertAlmostEqual(delta[1].item(), .4, places=6)
         noisy = torch.tensor([[[.8, .2], [.2, .8]]])
-        _, _, keep = return_targets(torch.tensor([[[.51, .5]]]), noisy, self.train)
+        _, _, keep = return_targets(torch.tensor([[[.51, .5]]]), noisy, mixed)
         self.assertFalse(keep.item())
+
+    def test_pure_greedy_uses_equality_tolerance_separately_from_training_gap(self):
+        greedy = torch.tensor([[[.5 + .0005, .5]], [[.5 + 5e-13, .5]]], dtype=torch.float64)
+        delta, se, keep = return_targets(greedy, None, self.train)
+        self.assertEqual(keep.tolist(), [True, False])
+        self.assertEqual(se.tolist(), [0., 0.])
+        self.assertEqual(return_targets(greedy, None, replace(self.train, ranking_min_gap=.001))[2].tolist(),
+                         [False, False])
+
+    def test_pure_greedy_collection_skips_stochastic_continuation(self):
+        state = critical_state()
+        model = MKPModel(self.config).eval()
+        data = state.profits, state.weights, state.capacities
+        rollout = dict(active=torch.ones(1, 1, dtype=torch.bool),
+                       remaining=state.remaining[None], selected=state.selected[None])
+        with patch("mkp_ranking.paired_terminal_returns", wraps=paired_terminal_returns) as continuation:
+            batch, metrics = collect_ranking_batch(model, data, rollout,
+                                                    replace(self.train, ranking_repeats=1), seed=17)
+        self.assertEqual(continuation.call_count, 1)
+        self.assertEqual(continuation.call_args.args[4:6], (1, False))
+        self.assertEqual(metrics["ranking_non_equal"], 1)
+        self.assertEqual(metrics["ranking_gap_below_0_001"], 0)
+        self.assertGreater(metrics["ranking_target_offset"], 0.)
+        self.assertIsNotNone(batch)
+        self.assertEqual(batch.delta.dtype, torch.float32)
 
     def test_collection_preserves_model_rng_and_mode(self):
         state = critical_state()
@@ -262,8 +302,9 @@ class OpportunityTests(unittest.TestCase):
                     load_checkpoint(path, "cpu")
 
     def test_config_rejects_invalid_settings(self):
-        for kwargs in (dict(ranking_repeats=1), dict(ranking_candidates=1),
+        for kwargs in (dict(ranking_repeats=1, ranking_greedy_weight=.5), dict(ranking_candidates=1),
                        dict(ranking_coefficient=-1), dict(ranking_min_gap=float("nan")),
+                       dict(ranking_equality_tolerance=float("nan")),
                        dict(ranking_score_scale=0), dict(ranking_pool_size=1)):
             with self.assertRaises(ValueError):
                 TrainConfig(**kwargs)
@@ -300,12 +341,18 @@ class OpportunityTests(unittest.TestCase):
         from mkp_Trainer import main
         with patch("mkp_Trainer.MKPTrainer") as trainer:
             main(["--resources", "5", "--ranking-coefficient", "0", "--ranking-states", "8",
-                  "--ranking-repeats", "2", "--opportunity-weight-max", "0", "--reserve-weight-max", "0",
+                  "--ranking-repeats", "1", "--ranking-min-gap", "0.0001",
+                  "--ranking-equality-tolerance", "1e-10", "--ranking-greedy-weight", "1",
+                  "--opportunity-weight-max", "0", "--reserve-weight-max", "0",
                   "--opportunity-tokens", "0", "--no-actor-edge-values", "--checkpoint-dir", "test-output"])
         train, model = trainer.call_args.args
         self.assertEqual(train.checkpoint_dir, Path("test-output"))
         self.assertEqual(train.ranking_coefficient, 0)
         self.assertEqual(train.ranking_states, 8)
+        self.assertEqual(train.ranking_min_gap, .0001)
+        self.assertEqual(train.ranking_equality_tolerance, 1e-10)
+        self.assertEqual(train.ranking_greedy_weight, 1.)
+        self.assertEqual(train.ranking_repeats, 1)
         self.assertEqual(model.opportunity_weight_max, 0)
         self.assertFalse(model.actor_edge_values)
         trainer.return_value.train.assert_called_once_with(None)
