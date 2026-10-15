@@ -4,9 +4,9 @@ import math
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-CHECKPOINT_VERSION = 5
-CONTROLLER_VERSION = "combination_theta_v5"
-DECODER_VERSION = "second_order_density_v5"
+CHECKPOINT_VERSION = 6
+CONTROLLER_VERSION = "gated_combination_theta_v6"
+DECODER_VERSION = "profit_efficiency_density_v6"
 
 @dataclass
 class TrainConfig:
@@ -58,7 +58,7 @@ class TrainConfig:
     cache_headroom_gib: float = 6.0
     feature_cache_batch_size: int = 64
     runs_dir: Path = field(default_factory=lambda: ROOT / "runs")
-    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / "combination_v5")
+    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / "profit_efficiency_v6")
 
     def __post_init__(self):
         counts = (self.updates, self.batch_size, self.minibatch_size, self.ppo_epochs,
@@ -138,6 +138,10 @@ class ModelConfig:
     combination_initial_weight: float = 0.02
     companion_scales: tuple[float, ...] = (0.5, 2.0, 8.0)
     combination_chunk_size: int = 64
+    # One shared state-level control; no learned item scores in the decoder.
+    efficiency_gate: bool = True
+    efficiency_gate_initial: float = 0.95
+    terminal_profit_override: bool = True
     eps: float = 1e-8
 
     def __post_init__(self):
@@ -169,6 +173,10 @@ class ModelConfig:
                                              self.opportunity_bandwidth)):
             raise ValueError("Opportunity score settings must be finite")
         self.companion_scales = tuple(self.companion_scales)
+        if not isinstance(self.efficiency_gate, bool) or not isinstance(self.terminal_profit_override, bool):
+            raise ValueError("Efficiency gate switches must be boolean")
+        if not math.isfinite(self.efficiency_gate_initial) or not 0 < self.efficiency_gate_initial < 1:
+            raise ValueError("efficiency_gate_initial must be finite and strictly between 0 and 1")
         if not self.companion_scales or any(not math.isfinite(x) or x <= 0 for x in self.companion_scales):
             raise ValueError("companion_scales must be finite and positive")
         if tuple(sorted(set(self.companion_scales))) != self.companion_scales:
@@ -205,7 +213,7 @@ class BenchmarkConfig:
     dataset: Path = field(default_factory=lambda: ROOT / "MKP_dataset" / "Benchmarks_Chu.mat")
     num_resources: tuple[int, ...] = (5, 10)
     num_items: tuple[int, ...] = (100, 250, 500)
-    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / "combination_v5")
+    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / "profit_efficiency_v6")
     results_dir: Path = field(default_factory=lambda: ROOT / "results")
     checkpoint_tag: str = "best"
     device: str = "auto"

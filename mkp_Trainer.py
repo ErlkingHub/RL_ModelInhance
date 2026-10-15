@@ -18,7 +18,7 @@ from mkp_config import (CHECKPOINT_VERSION, CONTROLLER_VERSION, DECODER_VERSION,
 from mkp_data import synthetic_batch
 from mkp_env import MKPEnv, MKPState
 from mkp_Model import MKPModel
-from mkp_basis import COMBINATION_METRICS, decoder_statistics
+from mkp_basis import COMBINATION_METRICS, decoder_statistics, GATE_METRICS, gate_statistics
 from mkp_ranking import collect_ranking_batch, ranking_objective, ranking_kl
 from mkp_performance import (GIB, PERFORMANCE_FIELDS, configure_training_runtime,
                              build_rollout_cache, prepare_state)
@@ -48,14 +48,16 @@ def collect_rollout(model, data):
                                   "values", "rewards", "dones", "active")}
     model.eval()  # no dropout anywhere: collection and PPO recomputation agree
     combination_sum = data[0].new_zeros(len(COMBINATION_METRICS), dtype=torch.float32)
+    gate_sum = data[0].new_zeros(len(GATE_METRICS), dtype=torch.float32)
     transition_count = data[0].new_zeros((), dtype=torch.float32)
     for _ in range(data[0].shape[1]):
         active = env.state.active
         if not active.any():
             break
         policy, value, theta, _ = model(env.state)
-        combination = torch.cat((theta.statistics()[:, -2:], decoder_statistics(policy)), -1)
+        combination = torch.cat((theta.statistics()[:, 7:9], decoder_statistics(policy)), -1)
         combination_sum += (combination * active[:, None]).sum(0)
+        gate_sum += (gate_statistics(policy) * active[:, None]).sum(0)
         transition_count += active.sum()
         actions = policy.choose(stochastic=True)
         records["remaining"].append(env.state.remaining.clone())
@@ -76,6 +78,7 @@ def collect_rollout(model, data):
     result["utilization"] = (1 - env.state.remaining / env.state.capacities).mean()
     result["combination_metrics"] = dict(zip(COMBINATION_METRICS,
                                               (combination_sum / transition_count.clamp_min(1)).tolist()))
+    result["gate_metrics"] = dict(zip(GATE_METRICS, (gate_sum / transition_count.clamp_min(1)).tolist()))
     return result
 
 
@@ -105,6 +108,7 @@ class MKPTrainer:
                         "ranking_standard_error", "ranking_label_seconds", "ranking_loss",
                         "ranking_accuracy", "ranking_kl", "ranking_minibatches"]
         self.fields += list(COMBINATION_METRICS)
+        self.fields += list(GATE_METRICS)
         self.fields += list(PERFORMANCE_FIELDS)
         with (self.run_dir / "metrics.csv").open("w", newline="", encoding="utf-8") as f:
             csv.DictWriter(f, fieldnames=self.fields).writeheader()
@@ -300,6 +304,7 @@ class MKPTrainer:
                        objective_mean=rollout["objective"].mean().item(),
                        normalized_return=(rollout["objective"] / data[0].sum(-1)).mean().item(),
                        utilization=rollout["utilization"].item(), **stats, **rollout.get("combination_metrics", {}),
+                       **rollout.get("gate_metrics", {}),
                        validation_return=validation_return, validation_improvement_pct=improvement,
                        best_validation_return=best, elapsed_seconds=time.perf_counter() - began)
             history.append(row)
@@ -313,6 +318,8 @@ class MKPTrainer:
             self.logger.info("M=%d update=%d COMBINATION | interaction_mass=%.5f companion_mass=%.5f "
                              "penalty=%.5f bonus=%.5f abs_delta=%.5f margin_ratio=%.5f",
                              m, update, *(row.get(key, 0.) for key in COMBINATION_METRICS))
+            self.logger.info("M=%d update=%d PROFIT_EFFICIENCY | gate=%.5f effective_gate=%.5f terminal_rate=%.5f",
+                             m, update, *(row.get(key, 0.) for key in GATE_METRICS))
             self.logger.info("M=%d update=%d RANKING | accepted=%d/%d loss=%.5f accuracy=%.4f "
                              "return_gap=%.6f SE=%.6f KL=%.5f label_seconds=%.2f",
                              m, update, stats.get("ranking_pairs", 0), stats.get("ranking_proposed", 0),
@@ -402,6 +409,11 @@ def main(argv=None):
     parser.add_argument("--combination-initial-weight", type=float, default=model_defaults.combination_initial_weight)
     parser.add_argument("--companion-scales", type=float, nargs="+", default=model_defaults.companion_scales)
     parser.add_argument("--combination-chunk-size", type=int, default=model_defaults.combination_chunk_size)
+    parser.add_argument("--efficiency-gate", action=argparse.BooleanOptionalAction,
+                        default=model_defaults.efficiency_gate)
+    parser.add_argument("--terminal-profit-override", action=argparse.BooleanOptionalAction,
+                        default=model_defaults.terminal_profit_override)
+    parser.add_argument("--efficiency-gate-initial", type=float, default=model_defaults.efficiency_gate_initial)
     args = parser.parse_args(argv)
     config = TrainConfig(num_resources=tuple(args.resources), train_num_items=tuple(args.train_items),
                          updates=args.updates, batch_size=args.batch_size, minibatch_size=args.minibatch_size,
@@ -424,5 +436,7 @@ def main(argv=None):
                         interaction_weight_max=args.interaction_weight_max,
                         companion_weight_max=args.companion_weight_max,
                         combination_initial_weight=args.combination_initial_weight,
-                        companion_scales=tuple(args.companion_scales), combination_chunk_size=args.combination_chunk_size)
+                        companion_scales=tuple(args.companion_scales), combination_chunk_size=args.combination_chunk_size,
+                        efficiency_gate=args.efficiency_gate, efficiency_gate_initial=args.efficiency_gate_initial,
+                        terminal_profit_override=args.terminal_profit_override)
     MKPTrainer(config, model).train(args.resume)

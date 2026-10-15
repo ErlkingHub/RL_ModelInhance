@@ -20,7 +20,7 @@ def feature_signature(config):
         "eps", "feature_clip", "actor_postdecision_features", "actor_pair_attention",
         "actor_contrast_pooling", "actor_relation_bandwidth", "opportunity_weight_max",
         "reserve_weight_max", "opportunity_bandwidth", "interaction_weight_max",
-        "companion_weight_max", "companion_scales"))
+        "companion_weight_max", "companion_scales", "efficiency_gate", "terminal_profit_override"))
 
 
 @dataclass
@@ -56,7 +56,7 @@ def prepare_state(state, config):
         return state
     from mkp_Model import state_features, WeakDecoder
     from mkp_attention import candidate_relations
-    from mkp_basis import interaction_loads, companion_basis
+    from mkp_basis import interaction_loads, companion_basis, has_feasible_pair
 
     state._prepared = None
     payload = dict(zip(("item", "resource", "edge", "global"), state_features(state, config)))
@@ -77,14 +77,22 @@ def prepare_state(state, config):
         payload.update(blocked=dense(blocked), reserve=dense(reserve))
     if config.interaction_weight_max:
         payload["interaction"] = dense(interaction_loads(state, owners, items, config.eps))
+    terminal_enabled = config.efficiency_gate and config.terminal_profit_override
     if config.companion_weight_max:
-        payload["companion"] = dense(companion_basis(state, owners, items, config))
+        if terminal_enabled:
+            basis, pair_exists = companion_basis(state, owners, items, config, return_has_pair=True)
+            payload["companion"] = dense(basis)
+            payload["has_feasible_pair"] = pair_exists
+        else:
+            payload["companion"] = dense(companion_basis(state, owners, items, config))
+    elif terminal_enabled:
+        payload["has_feasible_pair"] = has_feasible_pair(state, owners, items, config.combination_chunk_size)
     state._prepared = PreparedFeatures(payload, feature_signature(config), state_stamp(state))
     return state
 
 
 def configure_training_runtime(model, train, device):
-    """Keep model.config/state_dict unchanged so v5 resume contracts still hold."""
+    """Keep model.config/state_dict unchanged so current resume contracts still hold."""
     from mkp_attention import PairRelationAttention
     device = torch.device(device)
     profile = train.performance_profile

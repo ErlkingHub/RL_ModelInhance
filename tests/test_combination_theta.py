@@ -27,7 +27,9 @@ class CombinationThetaTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(101)
         torch.set_num_threads(2)
-        self.config = ModelConfig(embed_dim=16, num_heads=4, num_layers=1, combination_chunk_size=2)
+        # These isolate the pre-existing combination bases; gate behavior has its own tests.
+        self.config = ModelConfig(embed_dim=16, num_heads=4, num_layers=1, combination_chunk_size=2,
+                                  efficiency_gate=False)
 
     def test_pair_bonus_exposes_better_combination_than_high_density_single_item(self):
         state = complementary_state()

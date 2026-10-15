@@ -11,6 +11,7 @@ from torch import nn
 COMBINATION_METRICS = ("interaction_weight_sum", "companion_weight_sum",
                        "interaction_penalty_mean", "companion_bonus_mean",
                        "combination_abs_mean", "combination_to_base_margin_ratio")
+GATE_METRICS = ("efficiency_gate_mean", "effective_efficiency_gate_mean", "terminal_profit_override_rate")
 
 
 class CombinationControlHead(nn.Module):
@@ -65,21 +66,45 @@ def interaction_loads(state, owners, items, eps):
     return (weight / (weight + demand[owners]).clamp_min(eps)).float()
 
 
+def _pair_geometry(state, owners, items, chunk_size):
+    """Existing pair arithmetic in float64; distinct, currently feasible items only."""
+    feasible = state.feasible
+    ids = torch.arange(state.profits.shape[1], device=items.device)
+    for row, col in zip(owners.split(chunk_size), items.split(chunk_size)):
+        margin = (state.remaining[row] - state.weights[row, col])[:, None] - state.weights[row]
+        valid = feasible[row] & (ids[None] != col[:, None]) & (margin >= 0).all(-1)
+        yield row, col, margin, valid
+
+
+def _state_has_pair(owners, candidate_has_pair, batch_size):
+    # Integer counts keep this detached reduction deterministic on CUDA too.
+    counts = owners.new_zeros(batch_size).scatter_add(0, owners, candidate_has_pair.long())
+    return counts > 0
+
+
 @torch.no_grad()
-def companion_basis(state, owners, items, config):
+def has_feasible_pair(state, owners, items, chunk_size):
+    """Whether a state can still accept two items; no rollout, partner choice or search."""
+    parts = [valid.any(-1) for _, _, _, valid in _pair_geometry(state, owners, items, chunk_size)]
+    candidates = torch.cat(parts) if parts else owners.new_empty(0, dtype=torch.bool)
+    return _state_has_pair(owners, candidates, state.profits.shape[0])
+
+
+@torch.no_grad()
+def companion_basis(state, owners, items, config, *, return_has_pair=False):
     """K best static two-item matches; the partner is neither chosen nor rolled out.
 
     Pair utility combines bounded pair profit and leftover capacity in feasible
     mean-demand units. Max pooling keeps a rare good partner visible at larger N.
-    A zero feature means there is no feasible, distinct partner.
+    Feasible-pair detection uses boolean geometry, never possibly underflowed bonuses.
+    return_has_pair reuses that geometry for the terminal profit override.
     """
-    feasible, demand, mean_profit = feasible_means(state, config.eps)
+    _, demand, mean_profit = feasible_means(state, config.eps)
     scales = state.profits.new_tensor(config.companion_scales)
-    ids = torch.arange(state.profits.shape[1], device=items.device)
-    parts = []
-    for row, col in zip(owners.split(config.combination_chunk_size), items.split(config.combination_chunk_size)):
-        margin = (state.remaining[row] - state.weights[row, col])[:, None] - state.weights[row]
-        valid = (feasible[row] & (ids[None] != col[:, None]) & (margin >= 0).all(-1))
+    parts, pair_parts = [], []
+    for row, col, margin, valid in _pair_geometry(state, owners, items, config.combination_chunk_size):
+        if return_has_pair:
+            pair_parts.append(valid.any(-1))
         used_resource = demand[row] > 0
         residual = (margin.clamp_min(0) / demand[row, None].clamp_min(config.eps))
         residual = (residual * used_resource[:, None]).sum(-1) / used_resource.sum(-1)[:, None].clamp_min(1)
@@ -88,7 +113,17 @@ def companion_basis(state, owners, items, config):
         values = (quality[..., None] * torch.exp(-residual[..., None] / scales)
                   * valid[..., None])
         parts.append(values.amax(1).float())
-    return torch.cat(parts) if parts else state.profits.new_empty((0, len(config.companion_scales)), dtype=torch.float32)
+    basis = torch.cat(parts) if parts else state.profits.new_empty((0, len(config.companion_scales)), dtype=torch.float32)
+    if return_has_pair:
+        candidates = torch.cat(pair_parts) if pair_parts else owners.new_empty(0, dtype=torch.bool)
+        return basis, _state_has_pair(owners, candidates, state.profits.shape[0])
+    return basis
+
+
+def gate_statistics(policy):
+    """Detached state-level controls, averaged by active transitions by the caller."""
+    return torch.stack(tuple(policy.score_terms[key].detach().float() for key in
+                             ("efficiency_gate", "effective_efficiency_gate", "terminal_profit_override")), -1)
 
 
 def decoder_statistics(policy):

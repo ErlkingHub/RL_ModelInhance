@@ -98,7 +98,7 @@ class OpportunityTests(unittest.TestCase):
     def test_ablation_is_exact_old_formula_and_critic_has_no_new_modules(self):
         config = replace(self.config, opportunity_weight_max=0, reserve_weight_max=0,
                          opportunity_tokens=0, actor_edge_values=False,
-                         interaction_weight_max=0, companion_weight_max=0)
+                         interaction_weight_max=0, companion_weight_max=0, efficiency_gate=False)
         model = MKPModel(config)
         state = critical_state()
         theta = model.actor(state)[0]
@@ -277,7 +277,7 @@ class OpportunityTests(unittest.TestCase):
         model = MKPModel(self.config)
         for mode in ("fixed", "learned_static", "learned_dynamic"):
             result = construct_solution((state.profits, state.weights, state.capacities), model, mode)
-            self.assertEqual(result["theta_mean"].shape, (1, 9))
+            self.assertEqual(result["theta_mean"].shape, (1, 10))
             self.assertEqual(result["decoder_mean"].shape, (1, 4))
             self.assertTrue(torch.isfinite(result["theta_mean"]).all())
             self.assertTrue((result["remaining"] >= 0).all())

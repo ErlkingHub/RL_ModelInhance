@@ -10,7 +10,7 @@ import torch
 from torch import nn
 from mkp_config import ModelConfig
 from mkp_env import MKPState
-from mkp_basis import CombinationControlHead, interaction_loads, companion_basis
+from mkp_basis import CombinationControlHead, interaction_loads, companion_basis, has_feasible_pair
 from mkp_performance import cached_features, prepare_state
 from mkp_attention import (POST_DIM, RESOURCE_POST_DIM, candidate_relations,
                            PairRelationAttention, CriticalContrastPool, CandidateRelations,
@@ -186,6 +186,7 @@ class StrategyTheta:
     reserve_weight: torch.Tensor      # [B], smooth loss of future capacity margins
     resource_interactions: torch.Tensor  # [B,M,M], symmetric; upper-triangle coefficients counted once
     companion_weights: torch.Tensor      # [B,K], nonnegative fixed pair-basis coefficients
+    efficiency_gate: torch.Tensor        # [B], shared profit/efficiency switch in [0,1]
 
     def detach(self):
         return StrategyTheta(*(getattr(self, field.name).detach() for field in fields(self)))
@@ -194,7 +195,8 @@ class StrategyTheta:
         return torch.stack((self.profit_exponent, self.scarcity_exponent, self.bottleneck_weight,
                             self.temperature, self.resource_prices.std(-1, unbiased=False),
                             self.opportunity_weight, self.reserve_weight,
-                            self.resource_interactions.triu().sum((-1, -2)), self.companion_weights.sum(-1)), -1)
+                            self.resource_interactions.triu().sum((-1, -2)), self.companion_weights.sum(-1),
+                            self.efficiency_gate), -1)
 
 
 class HighLevelController(nn.Module):
@@ -206,6 +208,10 @@ class HighLevelController(nn.Module):
         self.price_context = nn.Sequential(nn.Linear(3 * config.embed_dim, config.embed_dim), nn.GELU())
         self.price_head = nn.Linear(config.embed_dim, 1, bias=False)
         self.strategy_head = nn.Linear(config.embed_dim, 6)
+        self.efficiency_gate_head = nn.Linear(config.embed_dim, 1)
+        nn.init.zeros_(self.efficiency_gate_head.weight)
+        initial_gate = config.efficiency_gate_initial
+        nn.init.constant_(self.efficiency_gate_head.bias, math.log(initial_gate / (1 - initial_gate)))
         self.combination_head = CombinationControlHead(config)
         # Auxiliary state supervision only. Its item outputs never enter decoder scores.
         self.feasibility_head = nn.Linear(config.embed_dim, 1)
@@ -231,13 +237,15 @@ class HighLevelController(nn.Module):
         prices = c.price_floor + (1 - c.price_floor) * m * price_logits.softmax(-1)
         controls = self.strategy_head(pooled).sigmoid()
         interaction, companion = self.combination_head(resources, pooled)
+        gate = (self.efficiency_gate_head(pooled).squeeze(-1).sigmoid() if c.efficiency_gate
+                else pooled.new_ones(pooled.shape[0]))
         theta = StrategyTheta(
             prices,
             c.profit_exponent_min + (c.profit_exponent_max - c.profit_exponent_min) * controls[:, 0],
             c.scarcity_exponent_max * controls[:, 1], c.bottleneck_weight_max * controls[:, 2],
             c.temperature_min + (c.temperature_max - c.temperature_min) * controls[:, 3],
             c.opportunity_weight_max * controls[:, 4], c.reserve_weight_max * controls[:, 5],
-            interaction, companion)
+            interaction, companion, gate)
         return theta, self.feasibility_head(items).squeeze(-1)
 
 
@@ -298,6 +306,9 @@ class WeakDecoder:
               - sum_{r<=s} interaction_rs * z_ir * z_is
               + sum_k companion_weight_k * companion_basis_ik
     pi(i|s) = softmax(score_i / temperature) over feasible candidates.
+    v6: score = profit_term + effective_gate * (v5_score - profit_term).
+    The effective gate is zero when no pair of feasible items fits together;
+    otherwise it is the controller's state-level gate (one for the ablation).
     """
     def __init__(self, config: ModelConfig):
         self.config = config
@@ -310,7 +321,8 @@ class WeakDecoder:
                              torch.full((b,), 0.2, device=device),
                              torch.zeros(b, device=device), torch.zeros(b, device=device),
                              torch.zeros(b, m, m, device=device),
-                             torch.zeros(b, len(self.config.companion_scales), device=device))
+                             torch.zeros(b, len(self.config.companion_scales), device=device),
+                             torch.ones(b, device=device))
 
     @torch.no_grad()
     def opportunity_features(self, state, owners, items):
@@ -366,7 +378,8 @@ class WeakDecoder:
         log_cost = torch.where(zero_cost, log_cost.new_full(log_cost.shape, math.log(eps)), log_cost)
         profit = p[owners, items] / p.mean(-1)[owners].clamp_min(eps)
         bottleneck = (candidate_w / rem[owners].clamp_min(eps)).amax(-1)
-        scores = theta.profit_exponent[owners] * profit.clamp_min(eps).log() - log_cost
+        profit_term = theta.profit_exponent[owners] * profit.clamp_min(eps).log()
+        scores = profit_term - log_cost
         scores = scores - theta.bottleneck_weight[owners] * bottleneck
         if self.config.opportunity_weight_max or self.config.reserve_weight_max:
             blocked, reserve = (self.opportunity_features(state, owners, items) if cached is None else
@@ -379,13 +392,37 @@ class WeakDecoder:
             z = (interaction_loads(state, owners, items, eps) if cached is None else
                  cached["interaction"][owners, items])
             penalty = (theta.resource_interactions[owners].triu() * z[:, :, None] * z[:, None, :]).sum((-1, -2))
+        terminal_enabled = self.config.efficiency_gate and self.config.terminal_profit_override
+        pair_exists = None
         if self.config.companion_weight_max:
-            basis = (companion_basis(state, owners, items, self.config) if cached is None else
-                     cached["companion"][owners, items])
+            if cached is not None:
+                basis = cached["companion"][owners, items]
+            elif terminal_enabled:
+                basis, pair_exists = companion_basis(state, owners, items, self.config, return_has_pair=True)
+            else:
+                basis = companion_basis(state, owners, items, self.config)
             bonus = (theta.companion_weights[owners] * basis).sum(-1)
         scores = base - penalty + bonus
+        gate = theta.efficiency_gate if self.config.efficiency_gate else torch.ones_like(theta.efficiency_gate)
+        terminal = torch.zeros_like(gate, dtype=torch.bool)
+        if terminal_enabled:
+            if cached is not None:
+                pair_exists = cached["has_feasible_pair"]
+            elif pair_exists is None:
+                pair_exists = has_feasible_pair(state, owners, items, self.config.combination_chunk_size)
+            terminal = state.active & ~pair_exists
+        effective_gate = torch.where(terminal, torch.zeros_like(gate), gate)
+        candidate_gate = effective_gate[owners]
+        # Preserve the old score exactly at g=1 and pure profit at g=0.
+        scores = torch.where(candidate_gate == 1, scores,
+                             profit_term + candidate_gate * (scores - profit_term))
+        base = torch.where(candidate_gate == 1, base,
+                           profit_term + candidate_gate * (base - profit_term))
+        penalty, bonus = candidate_gate * penalty, candidate_gate * bonus
         return CandidatePolicy(owners, items, scores / theta.temperature[owners], p.shape[0],
-                               dict(base=base, interaction_penalty=penalty, companion_bonus=bonus, score=scores))
+                               dict(base=base, interaction_penalty=penalty, companion_bonus=bonus, score=scores,
+                                    efficiency_gate=gate, effective_efficiency_gate=effective_gate,
+                                    terminal_profit_override=terminal))
 
 
 class MKPModel(nn.Module):
