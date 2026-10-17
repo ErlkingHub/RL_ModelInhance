@@ -5,7 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 CHECKPOINT_VERSION = 3
-DECODER_VERSION = "opportunity_density_v3"
+DECODER_VERSION = "opportunity_density_v10-17"
 
 @dataclass
 class TrainConfig:
@@ -52,7 +52,7 @@ class TrainConfig:
     deterministic: bool = True
     cpu_threads: int = 4
     runs_dir: Path = field(default_factory=lambda: ROOT / "runs")
-    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / "opportunity_v3")
+    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / "opportunity_v10-17")
 
     def __post_init__(self):
         counts = (self.updates, self.batch_size, self.minibatch_size, self.ppo_epochs,
@@ -166,7 +166,7 @@ class BenchmarkConfig:
     dataset: Path = field(default_factory=lambda: ROOT / "MKP_dataset" / "Benchmarks_Chu.mat")
     num_resources: tuple[int, ...] = (5, 10)
     num_items: tuple[int, ...] = (100, 250, 500)
-    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / "opportunity_v3")
+    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / "opportunity_v10-17")
     results_dir: Path = field(default_factory=lambda: ROOT / "results")
     checkpoint_tag: str = "best"
     device: str = "auto"
