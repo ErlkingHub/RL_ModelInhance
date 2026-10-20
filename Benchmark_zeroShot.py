@@ -9,7 +9,7 @@ import time
 import numpy as np
 import torch
 from mkp_config import BenchmarkConfig, config_dict
-from mkp_basis import COMBINATION_METRICS
+from mkp_basis import COMBINATION_METRICS, GATE_METRICS
 from mkp_data import instance_batch, load_benchmark
 from mkp_utils import (construct_solution, file_sha256, load_checkpoint, resolve_device,
                        seed_everything, write_json)
@@ -140,6 +140,8 @@ def benchmark(config=None):
                             "update": payload["update"], "model_config": payload["model_config"],
                             "train_num_items": payload["train_config"]["train_num_items"],
                             "training_data_source": payload["training_data_source"],
+                            "training_initialization": payload.get("training_initialization", {"mode": "fresh"}),
+                            "training_supervision_version": payload.get("training_supervision_version"),
                             "training_diagnostics": training_diagnostics(payload, m)}
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     output = c.results_dir / stamp
@@ -164,6 +166,7 @@ def benchmark(config=None):
               "opportunity_weight_mean", "reserve_weight_mean",
               "size_zero_shot", "checkpoint_sha256", "solution_file"]
     fields += list(COMBINATION_METRICS)
+    fields += list(GATE_METRICS)
     rows = []
     with (output / "instances.csv").open("w", newline="", encoding="utf-8-sig") as stream, \
          (output / "solutions.jsonl").open("w", encoding="utf-8") as solution_stream:
@@ -202,6 +205,7 @@ def benchmark(config=None):
                         size_zero_shot=int(instance.n not in metadata[str(instance.m)]["train_num_items"]),
                         checkpoint_sha256=metadata[str(instance.m)]["sha256"], solution_file="solutions.jsonl")
                     row.update(zip(COMBINATION_METRICS, combination))
+                    row.update(zip(GATE_METRICS, result["gate_mean"].tolist()))
                     instance_rows.append(row)
                     solution_stream.write(json.dumps({"instance_id": instance.instance_id, "method": method,
                                                       "item_indices_zero_based": sequence, "objective": objective}) + "\n")

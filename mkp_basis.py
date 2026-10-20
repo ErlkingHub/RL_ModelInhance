@@ -11,6 +11,16 @@ from torch import nn
 COMBINATION_METRICS = ("interaction_weight_sum", "companion_weight_sum",
                        "interaction_penalty_mean", "companion_bonus_mean",
                        "combination_abs_mean", "combination_to_base_margin_ratio")
+GATE_METRICS = ("efficiency_gate_mean", "effective_efficiency_gate_mean", "terminal_profit_override_rate")
+
+
+def gate_statistics(policy):
+    """Per-state controller gate, effective gate and exact terminal override."""
+    count = policy.logits.new_zeros(policy.batch_size).scatter_add(
+        0, policy.owners, torch.ones_like(policy.logits)).clamp_min(1)
+    return torch.stack([policy.logits.new_zeros(policy.batch_size).scatter_add(
+        0, policy.owners, policy.score_terms[key].detach().to(policy.logits.dtype)) / count
+        for key in ("efficiency_gate", "effective_efficiency_gate", "terminal_single_pick")], -1)
 
 
 class CombinationControlHead(nn.Module):

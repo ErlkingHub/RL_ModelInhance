@@ -4,11 +4,84 @@
 
 目标是在 `MKP_dataset/Benchmarks_Chu.mat` 上研究接近或低于 **0.1% gap** 的解。该目标需要实验验证，代码交付本身不代表达到该精度。默认训练与测试均由使用者运行。
 
-当前为 **combination θ v5**：在上一版的关系感知 Actor 上，扩展 `StrategyTheta` 和透明评分基函数，使网络识别到的资源联动与两物品搭配能够直接影响评分。checkpoint schema 为 5，控制器标识 `combination_theta_v5`，解码器标识 `second_order_density_v5`；v1–v4 checkpoint 明确拒绝加载，需要重新训练，默认保存至 `checkpoints/combination_v5/`。
+当前为 **决策教师训练 v9**：保留 v8 的资源感知网络，新增一个状态级资源成本门控，以及训练期的精确/有界教师、全候选监督和独立 Actor 更新。checkpoint schema 为 9，控制器 `resource_aware_efficiency_v9`，解码器 `gated_resource_density_v9`；默认目录为 `checkpoints/decision_teacher_v9/`。
+
+## 2026-10-20：从表示增强转向决策监督与表达修正
+
+v8 的已完成实验为 `results/20261019_223230_626191`：180 个 learned_dynamic 实例平均 gap **0.391789%**，相比 **0.399708%** 仅下降 **0.007919 个百分点（约 1.98%）**。紧约束组几乎不变。最佳点前 200 更新，有效排序对只占 M5 的 4.09%、M10 的 7.66%；旧 .001 筛选阈值按保存实例量纲换算平均约为 .2035 个 gap 百分点。这里是尺度诊断，不表示用 Chu 数据生成过训练标签。详见 [诊断](outputs/decision_supervision_v9/audit.md)。
+
+v9 的三项实质变化：
+
+1. **解除固定资源惩罚的表达限制。** θ 新增 `efficiency_gate[B]∈[0,1]`，控制资源成本整体强度：`score = α log(normalized_profit) − g × (log_cost + bottleneck + opportunity + reserve + interaction) + companion_bonus`。θ 仍不随 N 增长。若 float64 物理检查确认不存在可共同装入的两件可行物品，则有效 g=0，按收益结束构造；不使用推理期搜索或修复。
+2. **更强的合成训练教师。** 从真实 PPO 前缀和 greedy 前缀分层抽取早/中/后段状态。可行物品数≤16时，枚举全部剩余子集，给出每个可行动作的精确 Q*；更大剩余问题使用有时间/节点预算的 HiGHS MILP。求解结果重新核对原始 float64 可行性；未证明最优的 incumbent 必须优于当前冻结 greedy 完整后缀，且只作为当期方案模仿，不当作 Q* 或持久回放。进一步提取有界的可行方案前缀，避免只教第一步。
+3. **全候选、独立、可回退的 Actor 更新。** 对所有可行物品的原始分数计算目标集合概率质量，允许多个同样最优的第一步；不混合随机续行、不再用 .001 阈值丢弃标签。精确标签增加期望后悔损失。教师阶段在 PPO 后执行，使用独立 Actor AdamW；违反检查样本上的精确后悔/正确决策保持或 KL 限制时回退参数与 Adam 状态。Critic/GAE/环境奖励保持原语义，Actor 与 Critic 的梯度裁剪也分开。
+
+这属于 **PPO + 求解器辅助监督训练**，不再是单纯依赖自生成续行标签的训练。求解器只接收训练器传入的合成状态；推理仍是 `Actor → θ → 固定无参数弱解码器 → 单次 greedy 构造`。弱解码器研究边界得以保留。
+
+```powershell
+# 建议实验：从刚完成的 v8 权重迁入，使用新的监督训练；不会覆盖 v8 文件
+python train_ConstrainedMKP.py --warm-start checkpoints/resource_aware_v8 --checkpoint-dir checkpoints/decision_teacher_v9
+python Benchmark_zeroShot.py --checkpoint-dir checkpoints/decision_teacher_v9
+
+# 当前新结构/新公式，关闭教师并恢复旧成对监督，区分监督贡献
+python train_ConstrainedMKP.py --warm-start checkpoints/resource_aware_v8 --supervision-mode legacy --checkpoint-dir checkpoints/decision_teacher_v9_legacy
+
+# 可选：从头训练 v9；默认仍只训练合成 N=100
+python train_ConstrainedMKP.py
+# v9 的续训只接受同模型和同教师配置；updates 为累计目标
+python train_ConstrainedMKP.py --resources 5 --resume checkpoints/decision_teacher_v9/mkp_M5_last.pt --updates 4000
+```
+
+默认每 **5** 次 PPO 更新做一次教师阶段，抽取 **8** 个状态，每个较大剩余问题的 MILP 时间参数 **1 秒**、节点上限 **1000**；每个方案最多增加 **4** 个前缀，教师最多更新 **4** 次，检查批次 **8**，认证回放容量 **256**。求解器的时间参数不等于整个阶段的硬墙钟上限，另有 greedy 前缀/后缀及网络计算开销。参数均有 `--teacher-*` 开关；`--teacher-steps 0` 为无教师、无旧排序的 PPO 对照，`--supervision-mode legacy` 为旧排序对照。可用 `--no-terminal-profit-override` 单独关闭末段规则；`--efficiency-gate-initial` 只改变初值，不会冻结门控。
+
+迁移 v5/v8 时，全部旧参数严格加载，新门控从 **0.95** 初始化；**v9 评分发生变化，因此不承诺迁移策略与 v8 输出相同**。新的初始策略会在第 0 步接受合成验证并保存 `initial/best/last`；这保护的是 v9 起点的合成验证，不能保证 Chu gap。旧优化器/历史不迁入，v9 自身的 resume 则恢复 PPO/教师两个优化器和认证回放。
+
+日志新增 `TEACHER` 与 `teacher_*` 指标，区分 exact、认证 MILP、未认证 incumbent、抽样来源/阶段、更新接受/回退以及检查集合的正确决策保持。`teacher_regret_*` 只对完整精确 Q 行有效，须结合 `teacher_exact_guard_states` 阅读；该数量为零时日志中的零值不代表全局零后悔。训练和评估均记录原始/有效门控与末段覆盖比例。
+
+**v9 尚未进行完整训练或 Chu 评估，不能宣称已达到 0.1%。** 原公式存在可证明的微型反例，详见 [表达限制证明](outputs/decision_supervision_v9/decoder_counterexample.md)；这证明原固定参数族并非普遍充分，不证明 Chu 数据上的 0.1% 不可达。最新实现与验证见 [本轮报告](outputs/decision_supervision_v9/implementation.md)。
+
+本轮最终 CPU 检查：**125 项，121 通过、4 项 CUDA 检查跳过，0 失败、0 错误**。已核对真实 v8 M5/M10 权重与该轮实验 manifest 一致，全部 330 个旧权重张量严格迁移、源文件未改变；新增门控改变评分，因此迁移一致性不表示策略输出一致。
+
+## 历史 v8：资源需求、共同消耗与瓶颈控制
+
+本节记录上一轮已完成实现及当时验证。v9 的 checkpoint、评分、迁移与训练规则以上文为准。
+
+配对读取 180 个已保存的 `learned_dynamic` 结果：基线 gap **0.399708%**，已撤销版本 **0.436335%**。退化主要集中在 M=10、N=100、容量比例 0.25。基线平均利用率已达 **99.2996%**，因此本轮重点是提高资源的收益配置质量，而非只提高装载比例。完整对照和证据边界见 [改进说明](outputs/resource_controller_20261019/design_and_validation.md)。
+
+| 新结构 | 如何进入控制器 | 预期解决的信息传递问题 |
+| --- | --- | --- |
+| 10 维资源需求统计 | Actor 资源节点的残差输入 | 当前可行物品的负载均值/最大值/离散度、收益加权负载、供需压力、平均需求单位下的容量、瓶颈归因 |
+| 5 维资源共同消耗关系 | 每个原 Transformer block 后的资源关系注意力，关系同时进入 bias 和 Value | 区分“同一批物品同时消耗两个资源”和“物品分担不同资源”，保留相关性、压力不平衡及负载差异 |
+| 瓶颈资源汇总 | 在现有价格头、策略头和组合头之前，残差更新资源/全局表示 | 汇总显式压力、关键资源、资源极值与离散度，减少仅依赖平均表示造成的信息稀释 |
+
+新增模块位于 `mkp_resource.py`。物理统计使用 float64 且只统计当前可行物品；网络仍用 float32。额外几何计算为 `O(BNM²)`、固定几何存储为 `O(BM²)`；没有新增物品两两特征张量。原有物品关系路径仍是 N 的二次复杂度。默认总参数由 **2,550,093 增至 2,901,021（约 +13.76%）**，实际训练耗时/显存尚未测量。
+
+两个独立消融开关为 `--no-actor-resource-geometry` 和 `--no-controller-resource-readout`。同时关闭时移除 v8 的资源残差路径；当前 v9 的门控头仍保留，输出采用 v9 schema。四种组合应使用同一数据、训练预算、初始化来源及不同 checkpoint 目录比较；不从 Chu 结果选择 checkpoint。
+
+```powershell
+# 默认从头训练新结构，然后由使用者独立评估
+python train_ConstrainedMKP.py
+python Benchmark_zeroShot.py
+
+# 可选：从结构兼容的 v5 权重开始新实验，重置优化器和更新计数
+python train_ConstrainedMKP.py --warm-start checkpoints/combination_v5 --checkpoint-dir checkpoints/decision_teacher_v9_from_v5
+python Benchmark_zeroShot.py --checkpoint-dir checkpoints/decision_teacher_v9_from_v5
+
+# 两条新增结构均关闭的迁移对照；与上一个实验共用相同来源
+python train_ConstrainedMKP.py --warm-start checkpoints/combination_v5 --no-actor-resource-geometry --no-controller-resource-readout --checkpoint-dir checkpoints/decision_teacher_v9_no_resource
+```
+
+**当前 `combination_v5` 同名文件已被后续实验覆盖，其 SHA-256 不匹配 0.399708% 的历史 manifest。** 上述 warm-start 使用当前现存 v5 文件；如要从那轮确切权重开始，需把路径指向校验值匹配的备份。本轮没有把当前同名文件当作历史 0.399708% 的复现。
+
+新增路径的输出投影从零初始化。CPU 单状态检查确认：迁入现存 M=5/M=10 v5 权重后，θ、分数、Critic 和辅助输出逐位一致，源权重文件未改变。新实验记录来源校验值，先在固定合成验证集评估第 0 步，并保存 `initial/best/last`；后续验证退化不会覆盖初始 best。该保护只针对合成验证，不保证 Chu gap。零残差初始先学习输出投影；从头训练时原 θ 输出头也为零，上游策略梯度分阶段建立，接口检查不代表已学会资源分配。
+
+以上逐位一致性仅指历史 v5→v8 迁移。当前 `--resume` 只接受同配置 v9 checkpoint；v5/v8 必须显式使用 `--warm-start`，并按新评分训练。warm-start 严格核对原模型字段和全部权重，拒绝带有已撤销 readout 模块的变体，且不允许写回来源目录。
+
+历史 v8 验证为 **95 项回归检查，91 通过、4 项 CUDA 检查主动跳过**，仅覆盖接口与模拟流程；后来由使用者完成的 v8 实验 gap 为 0.391789%。本轮 v9 验证记录见开头链接，尚未完成正式实验。
 
 ## 24GB GPU 训练速度优化
 
-默认 `--performance-profile auto`：检测到至少 20GiB 的 CUDA 设备时启用 `memory24`，CPU/较小显存设备使用 `reference`。本机检测结果为 **RTX 5090 Laptop GPU，24463MiB 专用显存**，直接运行原训练命令即可启用。优化只调整执行方式，保留 v5 θ/弱解码器、独立 Critic、float32 网络与 float64 容量计算，以及原有 batch=64、PPO minibatch=128、3 epochs 和排序标签预算。
+默认 `--performance-profile auto`：检测到至少 20GiB 的 CUDA 设备时启用 `memory24`，CPU/较小显存设备使用 `reference`。该 profile 只调整执行方式，保留 float32 网络与 float64 容量计算，以及 batch=64、PPO minibatch=128、3 epochs。下方 GPU 测量来自历史 v5；v9 的教师阶段与终止判定开销尚未实测。
 
 | 修改 | 具体作用 |
 | --- | --- |
@@ -26,11 +99,11 @@ python train_ConstrainedMKP.py --performance-profile memory24
 python train_ConstrainedMKP.py --performance-profile reference
 # 只关闭跨 epoch 的整批状态缓存，保留大分块和单次前向内的特征复用
 python train_ConstrainedMKP.py --performance-profile memory24 --feature-cache-gib 0
-# 从已有 v5 checkpoint 续训；updates 是累计更新次数，原模型参数需保持一致
-python train_ConstrainedMKP.py --resources 5 --resume checkpoints/combination_v5/mkp_M5_last.pt --updates 4000
+# 从已有 v9 checkpoint 续训；updates 是累计更新次数，原模型及教师参数需保持一致
+python train_ConstrainedMKP.py --resources 5 --resume checkpoints/decision_teacher_v9/mkp_M5_last.pt --updates 4000
 ```
 
-**本轮速度优化不更改 checkpoint schema 或 model_config，不需要重训现有 v5 模型。** 执行设置单独保存到 `runtime_M5.json` / `runtime_M10.json` 和 checkpoint 的 `training_runtime`；`--resume` 可更改缓存预算或执行 profile。已启动的 Python 进程需要重启并续训才会使用新代码。扩大矩阵分块可能造成浮点舍入差异，不能承诺长程采样/训练逐位相同。独立 Benchmark 默认仍按 checkpoint 原模型配置推理。
+**切换执行 profile 本身不改变 checkpoint schema 或 model_config；本轮新增网络结构的迁移规则见上文。** 执行设置单独保存到 `runtime_M5.json` / `runtime_M10.json` 和 checkpoint 的 `training_runtime`；`--resume` 可更改缓存预算或执行 profile。已启动的 Python 进程需要重启并续训才会使用新代码。扩大矩阵分块可能造成浮点舍入差异，不能承诺长程采样/训练逐位相同。独立 Benchmark 默认仍按 checkpoint 原模型配置推理。
 
 2026-09-21 本机短时测量，PyTorch 2.11.0+cu128，B=128、N=100、M=10，默认网络；预热 2 次、计时 6 次，512 个合成状态，仅执行前向/反向：
 
@@ -48,7 +121,9 @@ python profile_training_speed.py --output outputs/performance_probe.json
 
 实际训练可查看 `train.log` 的 `SPEED` 行，及 CSV 中的 `rollout_seconds`、`ranking_label_seconds`、`ppo_seconds`（包括缓存构建，不含标签生成）、`feature_cache_seconds`、`feature_cache_gib`、`gpu_peak_allocated_gib` / `gpu_peak_reserved_gib`；后两者是本进程训练阶段的 PyTorch 显存峰值，不包含其他进程，也不包含随后独立验证阶段。
 
-## 组合 θ 修改：把组合信息传到解码器
+## 历史 v5 组合 θ：v9 继续使用的固定基函数
+
+本节记录 v5 的设计缘由与微型样例；v9 在这些项上增加资源门控，当前完整公式见“高层策略与固定弱解码器”。
 
 本分支上一版实际是 **M+6** 个 θ 条目，而非其他项目旧接口的 M+3。仅增强 attention 后，资源之间的关系仍需压缩进单资源价格和少量全局权重。本轮新增两组可解释的状态级控制参数：
 
@@ -59,7 +134,7 @@ python profile_training_speed.py --output outputs/performance_probe.json
 
 新 θ 有 `M+6+M(M+1)/2+K` 个非重复条目，默认 M=5 时为 29，M=10 时为 74；这是输出条目数，并未扣除价格归一化造成的冗余。张量为方便运算保存完整对称矩阵。**θ 维度不随物品数量 N 增长，网络仍不输出逐物品评分或 Q 值。** 资源对头用交换对称的资源表示生成系数，保持资源重排等变；全局头控制搭配尺度的权重。
 
-评分扩展为 `原有 score - 二阶资源成本 + 两物品搭配加分`，详细公式见下文。两个新增系数组各有独立的总幅度上界，默认均为 2，初始总幅度均为 0.02，避免新项在初始化时覆盖原有评分。将两个上界都设为 0，可以精确恢复上一版评分，并跳过新增基函数计算。PPO、奖励、独立 Critic、冻结策略终局排序标签保持不变；梯度通过固定基函数系数回到高层控制器。
+v5 当时把评分扩展为 `原有 score - 二阶资源成本 + 两物品搭配加分`。两个系数组各有独立的总幅度上界，默认均为 2，初始总幅度均为 0.02。将两个上界都设为 0，可以关闭这两类基函数；在 v9 中门控与末步规则仍然存在，不能据此声称恢复完整旧策略。梯度通过固定基函数系数回到高层控制器。
 
 微型表达能力测试：容量 `[10,10]`，A=`12/[6,6]`，B=`8/[10,0]`，C=`8/[0,10]`。原密度偏好 A，随后 B/C 都不可行；合法的搭配系数可使解码器先取 B、再取 C，合计 16。另一个测试验证交叉成本具有非零混合差分，并能改变相同总消耗候选的排序。**这些是人工设置合法 θ 的接口测试，不是训练所得策略或 gap 改善结果。**
 
@@ -69,7 +144,7 @@ python profile_training_speed.py --output outputs/performance_probe.json
 
 | 对照 | 训练参数 |
 | --- | --- |
-| 上一版评分 | `--interaction-weight-max 0 --companion-weight-max 0` |
+| 关闭两类基函数 | `--interaction-weight-max 0 --companion-weight-max 0` |
 | 仅二阶资源成本 | `--companion-weight-max 0` |
 | 仅两物品搭配 | `--interaction-weight-max 0` |
 | 两类同时启用 | 默认 |
@@ -77,12 +152,12 @@ python profile_training_speed.py --output outputs/performance_probe.json
 这些开关改变评分表达，与下方 Actor 感知开关相互独立。其他参数为 `--companion-scales 0.5 2 8`、`--combination-initial-weight 0.02`、`--combination-chunk-size 64`。更改尺度会改变基函数及 checkpoint 配置，续训必须使用原设置。
 
 ```powershell
-# 自行运行：完整 v5
-python train_ConstrainedMKP.py --checkpoint-dir checkpoints/combination_v5
-python Benchmark_zeroShot.py --checkpoint-dir checkpoints/combination_v5
-# 自行运行：同一 Actor、上一版评分的对照，需要单独重新训练
-python train_ConstrainedMKP.py --interaction-weight-max 0 --companion-weight-max 0 --checkpoint-dir checkpoints/ablation_v4_score
-python Benchmark_zeroShot.py --checkpoint-dir checkpoints/ablation_v4_score
+# 自行运行：当前 v9 全部机制
+python train_ConstrainedMKP.py --checkpoint-dir checkpoints/decision_teacher_v9
+python Benchmark_zeroShot.py --checkpoint-dir checkpoints/decision_teacher_v9
+# 自行运行：v9 关闭两类基函数的对照，需要独立重新训练
+python train_ConstrainedMKP.py --interaction-weight-max 0 --companion-weight-max 0 --checkpoint-dir checkpoints/v9_no_combination
+python Benchmark_zeroShot.py --checkpoint-dir checkpoints/v9_no_combination
 ```
 
 训练 `metrics.csv` / `train.log` 和 Benchmark `instances.csv` 增加 `interaction_weight_sum`、`companion_weight_sum`、`interaction_penalty_mean`、`companion_bonus_mean`、`combination_abs_mean`、`combination_to_base_margin_ratio`。最后一个指标是同状态下“新增修正的候选间极差 / 原有评分的候选间极差”，分母下限 1e-3，单候选/终止状态为 0；它不受公共分数偏移或采样温度影响。训练按有效状态步平均；Benchmark 先在每一步对候选统计，再对该轨迹的有效步平均。这些指标帮助检查尺度，不能替代配对终局收益和 gap。
@@ -118,7 +193,7 @@ python Benchmark_zeroShot.py --checkpoint-dir checkpoints/ablation_v4_score
 | 关闭相似候选差异池化 | `--no-actor-contrast-pooling` |
 | 恢复普通注意力/均值/竞争查询中的全物品聚合 | `--no-actor-feasible-attention` |
 
-前 3 个开关控制不同使用位置：关闭特征注入时，关系注意力和差异池化仍可使用关系特征；关系模块始终排除自身和无效候选。关闭第 4 项只恢复普通聚合中的全物品读取，不会把无效候选引入关系模块。四项全部关闭恢复 v3 的 Actor 编码结构，v5 组合输出头仍存在；若还要恢复原评分，需同时关闭两类新增系数上界。所有消融均使用 v5 checkpoint 格式。
+前 3 个开关控制不同使用位置：关闭特征注入时，关系注意力和差异池化仍可使用关系特征；关系模块始终排除自身和无效候选。关闭第 4 项只恢复普通聚合中的全物品读取，不会把无效候选引入关系模块。四项全部关闭后，还需关闭两个资源开关才移除这些新增编码路径；组合输出头与 v9 门控仍存在。这些编码消融不等价于恢复旧评分。当前所有消融均使用 v9 checkpoint 格式。
 
 关系特征计算额外需要 `O(BN²M)`，物品关系注意力约 `O(BN²D)`。`--actor-relation-chunk-size 32` 控制特征计算和注意力的查询分块，避免构造 `[B,N,N,D]` 的边 Value 张量；仍会缓存 `[B,N,N,7]` 关系及训练激活，**分块不意味着总内存对 N 线性增长**。N=250/500 的实际速度、显存及完整续行标注开销需正式运行测量。`--actor-relation-bandwidth 0.05` 控制余量平滑，`--actor-similarity-bandwidth 0.1` 控制相似候选权重。三个关系功能均关闭时跳过新增关系计算。
 
@@ -137,7 +212,7 @@ python Benchmark_zeroShot.py --checkpoint-dir checkpoints/ablation_v4_score
 # 自行运行：只训练一个资源维度
 & 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' train_ConstrainedMKP.py --resources 5 --updates 2000
 # 自行运行：从 last checkpoint 继续，updates 是累计更新次数目标
-& 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' train_ConstrainedMKP.py --resources 5 --resume checkpoints/combination_v5/mkp_M5_last.pt --updates 4000
+& 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' train_ConstrainedMKP.py --resources 5 --resume checkpoints/decision_teacher_v9/mkp_M5_last.pt --updates 4000
 # 可选：另报 128 条随机轨迹中的最佳解，不替代单轨迹 greedy 结果
 & 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' Benchmark_zeroShot.py --sample-rollouts 128
 ```
@@ -158,6 +233,8 @@ python Benchmark_zeroShot.py --checkpoint-dir checkpoints/ablation_v4_score
 | `profile_training_speed.py` | 合成状态前向/反向短时计时，不执行优化器更新              |
 | `mkp_Trainer.py`          | 完整 episode 采样、GAE、PPO、合成验证、日志、checkpoint   |
 | `mkp_ranking.py`          | 关键候选筛选、固定策略成对续行、收益标签与排序损失       |
+| `mkp_teacher.py`          | 训练期合成剩余问题的精确枚举、有预算 MILP 与独立可行性复核 |
+| `mkp_imitation.py`        | 全候选教师损失、独立 Actor 更新、保留检查与教师回放       |
 | `train_ConstrainedMKP.py` | 简洁训练入口                                              |
 | `Benchmark_zeroShot.py`   | 冻结推理、独立解校验、CSV 与物品序列                      |
 | `mkp_utils.py`            | 复现设置、checkpoint 合约、共享构造过程                   |
@@ -166,8 +243,8 @@ python Benchmark_zeroShot.py --checkpoint-dir checkpoints/ablation_v4_score
 - `runs/<时间戳>/train.log`：每次更新的日志。
 - `runs/<时间戳>/metrics.csv`：收益、归一化 return、利用率、PPO 各项损失、归一化 entropy、KL、梯度范数、Critic explained variance、合成验证表现。
 - `runs/<时间戳>/config.json`：配置与运行环境。
-- `checkpoints/combination_v5/mkp_M5_best.pt`、同目录 `mkp_M10_best.pt`：按固定合成验证集的 greedy 归一化收益选择。
-- `checkpoints/combination_v5/mkp_M5_last.pt`、同目录 `mkp_M10_last.pt`：最近一次保存的模型，包含优化器和 RNG 状态；默认每 100 次更新、产生新 best 及训练结束时保存。
+- `checkpoints/decision_teacher_v9/mkp_M5_best.pt`、同目录 `mkp_M10_best.pt`：按固定合成验证集的 greedy 归一化收益选择。
+- `checkpoints/decision_teacher_v9/mkp_M5_last.pt`、同目录 `mkp_M10_last.pt`：最近一次保存的模型，包含 PPO/教师优化器、教师回放和 RNG 状态；默认每 100 次更新、产生新 best 及训练结束时保存。
 - `results/<时间戳>/instances.csv`：逐实例、逐方法报告。
 - `results/<时间戳>/summary.csv`：每种方法按 M/N 分组及总体报告。
 - `results/<时间戳>/solutions.jsonl`：零基索引物品选择顺序，可独立复核。
@@ -262,7 +339,7 @@ Transformer 的作用是：
 
 ## 高层策略与固定弱解码器
 
-高层保留 M 个正资源价格及 6 个标量，再增加对称资源交互系数和 K 个搭配系数；共 `M+6+M(M+1)/2+K` 个非重复条目，维度不随 N 增长：
+高层保留 M 个正资源价格，v9 将标量增加至 7 个，再加上对称资源交互系数和 K 个搭配系数；共 `M+7+M(M+1)/2+K` 个非重复条目（默认 M5 为 30，M10 为 75），维度不随 N 增长：
 
 - `resource_prices`：均值为 1，避免价格尺度冗余。
 - `profit_exponent`：收益竞争强度 α。
@@ -271,6 +348,7 @@ Transformer 的作用是：
 - `temperature`：随机策略温度 τ；只影响采样概率，在同一步 greedy 排序中不改变 argmax。
 - `opportunity_weight`：选后永久失去的可行收益机会的惩罚强度 λ。
 - `reserve_weight`：选后资源余量下降的平滑惩罚强度 ρ。
+- `efficiency_gate`：状态级资源成本强度 g；当确认至多还能取一个物品时，固定规则将有效 g 置零。
 - `resource_interactions`：对称矩阵 A，非负，上三角总和不超过 `interaction_weight_max`；对角线控制平方成本，非对角线控制跨资源联动成本。
 - `companion_weights`：长度 K 的非负向量 b，总和不超过 `companion_weight_max`，控制不同剩余容量尺度下的搭配加分。
 
@@ -280,17 +358,20 @@ Transformer 的作用是：
 q_ij    = N * w_ij / C_j
 s_j     = C_j / max(c_j, eps)
 cost_i  = mean_j(price_j * q_ij * s_j ** beta)
-score_i = alpha * log(max(p_i / mean(p), eps))
-          - log(cost_i)
-          - kappa * max_j(w_ij / max(c_j, eps))
-          - opportunity_weight * blocked_mass_i
-          - reserve_weight * margin_loss_i
-          - sum_{r<=s}(A_rs * z_ir * z_is)
+resource_cost_i = log(cost_i)
+          + kappa * max_j(w_ij / max(c_j, eps))
+          + opportunity_weight * blocked_mass_i
+          + reserve_weight * margin_loss_i
+          + sum_{r<=s}(A_rs * z_ir * z_is)
+g_eff   = 0 if terminal_profit_override and no_feasible_pair else efficiency_gate
+score_i = alpha * log(max(p_i / mean(p), eps)) - g_eff * resource_cost_i
           + sum_k(b_k * F_ik)
 pi_i    = softmax(score_i / temperature)，只在可行候选集合中归一化
 ```
 
-零总资源消耗的物品用 eps 成本处理；数值实现使用 log-sum-exp。默认固定对照为 price=1、α=1、β=1、κ=0.1、τ=0.2、λ=ρ=0、A=b=0，保留原始密度基线。网络初始化为同样的密度参数，λ=ρ=0.1，A 的上三角系数总和与 b 的系数总和默认各为 0.02。
+零总资源消耗的物品用 eps 成本处理；数值实现使用 log-sum-exp。默认固定对照为 price=1、α=1、β=1、κ=0.1、τ=0.2、λ=ρ=0、A=b=0、g=1，并关闭末步规则，保留原始密度基线。新网络从相同密度参数开始，λ=ρ=0.1，A 的上三角系数总和与 b 的系数总和默认各为 0.02，g 初始化为 0.95；v8 迁移保留全部旧参数，新增门控仍初始化为 0.95。
+
+`no_feasible_pair` 对不同的可行物品按块检查 `(remaining-w_i)-w_j>=0`，使用环境同样的 float64 算术。至多还能取一个物品时，搭配项也为零，因此排序退化为收益优先。它不构造续行解；额外检查最坏为 `O(BN²M)`，缓存可在同一状态内复用。
 
 弱解码器没有可训练参数、物品指针网络、局部搜索、修复、beam search 或优化求解器。设每行可行候选数为 F：原始密度评分约 `O(FM)`，原机会项 `O(FNM)`，新增交互项 `O(FM²)`，搭配项 `O(FN(M+K))`。原机会项按 128 个候选分块，新搭配项按 `combination_chunk_size=64` 分块，临时空间约 `O(64N(M+K))`；没有枚举候选 i 之后所有 j/k 三元组合。`fixed` 对照会跳过所有未使用的机会及组合计算。无参数并不等于无推理开销。
 
@@ -339,7 +420,9 @@ h = opportunity_bandwidth = 0.05
 
 这些机会项只描述剩余候选集合和资源余量，不能把各物品的可行收益之和解释为可同时获得的终局收益。真正的长程方向来自下面的完整续行监督；有限维 θ 仍不保证所有状态都能表达最佳选择。
 
-### 同状态的长程排序训练
+### 历史成对排序训练（仅 `--supervision-mode legacy`）
+
+v9 默认使用本页开头说明的教师训练，以下成对排序仅作为独立对照保留。
 
 每次 PPO 更新之前，从本轮合成 rollout 抽取最多 64 个状态。以实际 greedy 候选为锚，在最高分的 8 个可行候选中，按利润差、逐资源占用差和原始 score 差选择相近对手。最多保留 16 个状态：约 3/4 优先取难区分的状态，其余随机选取，限制只盯着最小分差带来的偏置。
 
@@ -354,11 +437,11 @@ total_loss = 原 PPO/Value/可行性/Entropy 损失 + 0.1 * ranking_loss
 
 排序使用温度缩放**之前**的 score，模型不能只调低采样温度来满足排序监督。标签及续行均无梯度；梯度由固定 score 经 θ 回到 Actor，不进入 Critic。反事实分支不进入 PPO buffer，不改变 GAE/Value 的目标。每个 PPO minibatch 另外计算整个标签状态集合的全候选 KL，超过 `target_kl` 即停止后续更新，避免只检查已采样动作而遗漏其他候选的概率漂移。标签使用独立 RNG，不消耗主 rollout 随机流。
 
-`metrics.csv` / `train.log` 记录标签提议/接受数、平均终局收益差、标准误、标签耗时、排序损失、排序方向正确率和全候选 KL。`ranking_accuracy` 是当轮被接受训练对上的方向正确率；没有接受对时记 0，应结合 `ranking_pairs` 阅读，不能当作独立验证精度。Benchmark 记录原有 θ 均值及新增组合指标，checkpoint/manifest 保存 v5 控制器、解码器标识与完整模型配置。推理不执行反事实续行。
+`metrics.csv` / `train.log` 记录标签提议/接受数、平均终局收益差、标准误、标签耗时、排序损失、排序方向正确率和全候选 KL。`ranking_accuracy` 是当轮被接受训练对上的方向正确率；没有接受对时记 0，应结合 `ranking_pairs` 阅读，不能当作独立验证精度。Benchmark 记录 θ 均值、组合与门控指标，checkpoint/manifest 保存 v9 标识、教师版本与完整模型配置。推理不执行教师求解或反事实续行。
 
 ### 运行与独立消融
 
-默认命令已开启全部改动。以下是原 v3 机制的开关，可与前述 v4 控制器开关组合。建议每组使用相同种子、训练预算及独立 checkpoint 目录，最终比较同一批实例的配对收益/gap：
+以下是 legacy 排序机制的开关；研究这些开关时须显式添加 `--supervision-mode legacy`。建议每组使用相同种子、训练预算及独立 checkpoint 目录，最终比较同一批实例的配对收益/gap：
 
 | 关闭的部分 | 训练参数 |
 | --- | --- |
@@ -418,7 +501,7 @@ python Benchmark_zeroShot.py --checkpoint-dir checkpoints/ablation_no_ranking
 
 `tests/test_performance.py` 检查缓存前后的分数/价值/参数梯度一致性、状态变化后的失效、切片/配置切换、内存预算与分配失败回退、消融开关、PPO 缓存接线、CUDA 分块及 checkpoint 参数兼容。日志/续训流程测试仍使用模拟 rollout 与优化器。
 
-本次接口回归：`python -m unittest discover -s tests -v` 共 **74 项通过**，未执行真实优化器更新、完整训练或 Chu 评估。v5 改动了 θ 与透明评分公式，测试证明的是接口、表达和梯度通路，不代表训练后实际 gap 下降。最新速度优化及局部计时的范围见本文开头。
+历史 v5/v8 接口回归分别为 74/95 项；当前 v9 结果见 [CPU 验证记录](outputs/decision_supervision_v9/cpu_checks.json) 与 [真实 v8 权重迁移记录](outputs/decision_supervision_v9/transfer_checks.json)。测试证明的是接口、表达和梯度通路，不代表训练后实际 gap 下降。历史速度测量的适用范围见前文。
 
 
 ## 全流程如下：

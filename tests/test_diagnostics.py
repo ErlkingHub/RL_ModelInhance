@@ -104,7 +104,7 @@ class ConvergenceTests(unittest.TestCase):
         """Exercise real logging/checkpoint orchestration with deterministic fake rollout metrics."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            config = TrainConfig(num_resources=(5,), updates=5, batch_size=2, train_num_items=(4,),
+            config = TrainConfig(teacher_steps=0, num_resources=(5,), updates=5, batch_size=2, train_num_items=(4,),
                                  validation_every=1, validation_instances_per_shape=2, checkpoint_every=1,
                                  convergence_min_updates=3, convergence_patience_updates=2,
                                  convergence_min_evaluations=3, runs_dir=root / "runs",

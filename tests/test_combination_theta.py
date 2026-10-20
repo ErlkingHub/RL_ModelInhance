@@ -51,7 +51,9 @@ class CombinationThetaTests(unittest.TestCase):
         state = MKPEnv(torch.ones(1, 4) * 10,
                        torch.tensor([[[1., 1.], [1., 3.], [3., 1.], [3., 3.]]]),
                        torch.ones(1, 2) * 8).state
-        decoder = WeakDecoder(self.config)
+        # Isolate the interaction basis; terminal override intentionally chooses
+        # only by profit when no pair fits, and is tested separately.
+        decoder = WeakDecoder(replace(self.config, terminal_profit_override=False))
         theta = decoder.fixed_theta(state)
         theta.resource_interactions[0, 0, 1] = theta.resource_interactions[0, 1, 0] = 1
         penalty = decoder(state, theta).score_terms["interaction_penalty"]

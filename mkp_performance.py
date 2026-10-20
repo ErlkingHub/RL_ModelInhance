@@ -18,6 +18,8 @@ def feature_signature(config):
     # Chunk sizes affect execution only. All feature-defining settings belong here.
     return tuple(getattr(config, name) for name in (
         "eps", "feature_clip", "actor_postdecision_features", "actor_pair_attention",
+        "actor_resource_geometry", "controller_resource_readout",
+        "terminal_profit_override",
         "actor_contrast_pooling", "actor_relation_bandwidth", "opportunity_weight_max",
         "reserve_weight_max", "opportunity_bandwidth", "interaction_weight_max",
         "companion_weight_max", "companion_scales"))
@@ -61,11 +63,19 @@ def prepare_state(state, config):
     state._prepared = None
     payload = dict(zip(("item", "resource", "edge", "global"), state_features(state, config)))
     payload["feasible"] = state.feasible
+    if config.actor_resource_geometry or config.controller_resource_readout:
+        from mkp_resource import resource_geometry
+        geometry = resource_geometry(state, config)
+        payload["resource_node_geometry"] = geometry.nodes
+        payload["resource_pair_geometry"] = geometry.pairs
     if config.actor_postdecision_features or config.actor_pair_attention or config.actor_contrast_pooling:
         relations = candidate_relations(state, config)
         for name in ("pairs", "valid", "post", "resource_post"):
             payload["relation_" + name] = getattr(relations, name)
     owners, items = payload["feasible"].nonzero(as_tuple=True)
+    if config.terminal_profit_override:
+        payload["terminal_single_pick"] = WeakDecoder.terminal_single_pick(
+            state, chunk_size=config.actor_relation_chunk_size)
 
     def dense(values):
         result = values.new_zeros((*state.profits.shape, *values.shape[1:]))
@@ -84,7 +94,7 @@ def prepare_state(state, config):
 
 
 def configure_training_runtime(model, train, device):
-    """Keep model.config/state_dict unchanged so v5 resume contracts still hold."""
+    """Keep model.config/state_dict unchanged across execution profiles."""
     from mkp_attention import PairRelationAttention
     device = torch.device(device)
     profile = train.performance_profile

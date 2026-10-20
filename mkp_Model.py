@@ -11,6 +11,7 @@ from torch import nn
 from mkp_config import ModelConfig
 from mkp_env import MKPState
 from mkp_basis import CombinationControlHead, interaction_loads, companion_basis
+from mkp_resource import resource_geometry, ResourceGeometryEncoder, ResourceControllerReadout
 from mkp_performance import cached_features, prepare_state
 from mkp_attention import (POST_DIM, RESOURCE_POST_DIM, candidate_relations,
                            PairRelationAttention, CriticalContrastPool, CandidateRelations,
@@ -140,8 +141,10 @@ class BipartiteEncoder(nn.Module):
             self.opportunity_attention = nn.MultiheadAttention(d, config.num_heads, batch_first=True)
             self.opportunity_pool = nn.Sequential(
                 nn.Linear((config.opportunity_tokens + 1) * d, d), nn.GELU(), nn.LayerNorm(d))
+        self.resource_geometry_encoder = (ResourceGeometryEncoder(config)
+            if strategy and config.actor_resource_geometry else None)
 
-    def forward(self, state):
+    def forward(self, state, geometry=None):
         item_f, resource_f, edges, global_f = state_features(state, self.config)
         c = self.config
         relations = None
@@ -155,8 +158,13 @@ class BipartiteEncoder(nn.Module):
             edges = torch.cat((edges, relations.resource_post), -1)
         feasible = state.feasible if self.strategy and c.actor_feasible_attention else None
         items, resources = self.item_input(item_f), self.resource_input(resource_f)
-        for block in self.blocks:
+        if self.resource_geometry_encoder is not None:
+            geometry = resource_geometry(state, c) if geometry is None else geometry
+            resources = self.resource_geometry_encoder(resources, geometry)
+        for index, block in enumerate(self.blocks):
             items, resources = block(items, resources, edges, feasible, relations)
+            if self.resource_geometry_encoder is not None:
+                resources = self.resource_geometry_encoder(resources, geometry, index)
         items, resources = self.item_norm(items), self.resource_norm(resources)
         item_mean = (items.mean(1) if feasible is None else
                      (items * feasible[..., None]).sum(1) / feasible.sum(-1, keepdim=True).clamp_min(1))
@@ -186,6 +194,12 @@ class StrategyTheta:
     reserve_weight: torch.Tensor      # [B], smooth loss of future capacity margins
     resource_interactions: torch.Tensor  # [B,M,M], symmetric; upper-triangle coefficients counted once
     companion_weights: torch.Tensor      # [B,K], nonnegative fixed pair-basis coefficients
+    efficiency_gate: torch.Tensor | None = None  # [B], resource-cost strength in [0,1]
+
+    def __post_init__(self):
+        # Older positional analytic witnesses retain the full density formula.
+        if self.efficiency_gate is None:
+            self.efficiency_gate = torch.ones_like(self.profit_exponent)
 
     def detach(self):
         return StrategyTheta(*(getattr(self, field.name).detach() for field in fields(self)))
@@ -220,10 +234,20 @@ class HighLevelController(nn.Module):
             for j, (v, (lo, hi)) in enumerate(zip(defaults, bounds)):
                 fraction = min(0.999, max(0.001, (v - lo) / (hi - lo))) if hi > lo else 0.5
                 self.strategy_head.bias[j] = math.log(fraction / (1 - fraction))
+        self.resource_readout = (ResourceControllerReadout(config)
+                                 if config.controller_resource_readout else None)
+        self.efficiency_head = nn.Linear(config.embed_dim, 1)
+        nn.init.zeros_(self.efficiency_head.weight)
+        nn.init.constant_(self.efficiency_head.bias,
+                          math.log(config.efficiency_gate_initial / (1 - config.efficiency_gate_initial)))
 
     def forward(self, state):
-        items, resources, pooled = self.encoder(state)
         c = self.config
+        needs_geometry = self.encoder.resource_geometry_encoder is not None or self.resource_readout is not None
+        geometry = resource_geometry(state, self.encoder.config) if needs_geometry else None
+        items, resources, pooled = self.encoder(state, geometry)
+        if self.resource_readout is not None:
+            resources, pooled = self.resource_readout(resources, pooled, geometry)
         m = resources.shape[1]
         global_context = pooled[:, None, :].expand_as(resources)
         price_logits = self.price_head(self.price_context(torch.cat(
@@ -237,7 +261,7 @@ class HighLevelController(nn.Module):
             c.scarcity_exponent_max * controls[:, 1], c.bottleneck_weight_max * controls[:, 2],
             c.temperature_min + (c.temperature_max - c.temperature_min) * controls[:, 3],
             c.opportunity_weight_max * controls[:, 4], c.reserve_weight_max * controls[:, 5],
-            interaction, companion)
+            interaction, companion, self.efficiency_head(pooled).squeeze(-1).sigmoid())
         return theta, self.feasibility_head(items).squeeze(-1)
 
 
@@ -291,12 +315,14 @@ class WeakDecoder:
 
     q_ij = N * w_ij / C_j ; s_j = C_j / max(c_j, eps)
     cost_i = mean_j(price_j * q_ij * s_j ** beta)
-    score_i = alpha * log(p_i / mean(p)) - log(cost_i)
-              - kappa * max_j(w_ij / max(c_j, eps))
-              - opportunity_weight * blocked_profit_mass_i
-              - reserve_weight * smooth_margin_loss_i
-              - sum_{r<=s} interaction_rs * z_ir * z_is
+    resource_cost_i = log(cost_i) + kappa * max_j(w_ij / max(c_j, eps))
+                      + opportunity_weight * blocked_profit_mass_i
+                      + reserve_weight * smooth_margin_loss_i
+                      + sum_{r<=s} interaction_rs * z_ir * z_is
+    score_i = alpha * log(p_i / mean(p)) - efficiency_gate * resource_cost_i
               + sum_k companion_weight_k * companion_basis_ik
+    With terminal_profit_override, the gate is zero when no distinct feasible
+    pair fits, where every completion contains at most one further item.
     pi(i|s) = softmax(score_i / temperature) over feasible candidates.
     """
     def __init__(self, config: ModelConfig):
@@ -311,6 +337,36 @@ class WeakDecoder:
                              torch.zeros(b, device=device), torch.zeros(b, device=device),
                              torch.zeros(b, m, m, device=device),
                              torch.zeros(b, len(self.config.companion_scales), device=device))
+
+    @staticmethod
+    @torch.no_grad()
+    def terminal_single_pick(state, chunk_size=32):
+        """Whether at most one further item can fit; only static pair arithmetic.
+
+        Float64 subtraction matches environment capacity accounting. Selected,
+        infeasible and identical items are excluded. No completion, branching,
+        action selection or optimization is performed here.
+        """
+        if chunk_size < 1:
+            raise ValueError("Pair arithmetic chunk size must be positive")
+        feasible = state.feasible
+        weights, remaining = state.weights.double(), state.remaining.double()
+        batch, n = feasible.shape
+        has_pair = torch.zeros(batch, dtype=torch.bool, device=weights.device)
+        eligible = feasible.sum(-1) >= 2
+        ids = torch.arange(n, device=weights.device)
+        for start in range(0, n, chunk_size):
+            pending = (eligible & ~has_pair).nonzero(as_tuple=True)[0]
+            if pending.numel() == 0:
+                break
+            stop = min(start + chunk_size, n)
+            selected_weights = weights[pending]
+            valid = (feasible[pending, start:stop, None] & feasible[pending, None, :]
+                     & (ids[start:stop, None] != ids[None, :]))
+            margin = ((remaining[pending, None, None] - selected_weights[:, start:stop, None])
+                      - selected_weights[:, None])
+            has_pair[pending] = ((margin >= 0).all(-1) & valid).any(dim=(-1, -2))
+        return ~has_pair
 
     @torch.no_grad()
     def opportunity_features(self, state, owners, items):
@@ -366,15 +422,14 @@ class WeakDecoder:
         log_cost = torch.where(zero_cost, log_cost.new_full(log_cost.shape, math.log(eps)), log_cost)
         profit = p[owners, items] / p.mean(-1)[owners].clamp_min(eps)
         bottleneck = (candidate_w / rem[owners].clamp_min(eps)).amax(-1)
-        scores = theta.profit_exponent[owners] * profit.clamp_min(eps).log() - log_cost
-        scores = scores - theta.bottleneck_weight[owners] * bottleneck
+        profit_term = theta.profit_exponent[owners] * profit.clamp_min(eps).log()
+        resource_cost = log_cost + theta.bottleneck_weight[owners] * bottleneck
         if self.config.opportunity_weight_max or self.config.reserve_weight_max:
             blocked, reserve = (self.opportunity_features(state, owners, items) if cached is None else
                                 (cached["blocked"][owners, items], cached["reserve"][owners, items]))
-            scores = (scores - theta.opportunity_weight[owners] * blocked
-                      - theta.reserve_weight[owners] * reserve)
-        base = scores
-        penalty, bonus = torch.zeros_like(scores), torch.zeros_like(scores)
+            resource_cost = (resource_cost + theta.opportunity_weight[owners] * blocked
+                             + theta.reserve_weight[owners] * reserve)
+        penalty, bonus = torch.zeros_like(resource_cost), torch.zeros_like(resource_cost)
         if self.config.interaction_weight_max:
             z = (interaction_loads(state, owners, items, eps) if cached is None else
                  cached["interaction"][owners, items])
@@ -383,9 +438,22 @@ class WeakDecoder:
             basis = (companion_basis(state, owners, items, self.config) if cached is None else
                      cached["companion"][owners, items])
             bonus = (theta.companion_weights[owners] * basis).sum(-1)
-        scores = base - penalty + bonus
+        single_pick = (cached["terminal_single_pick"]
+                       if cached is not None and "terminal_single_pick" in cached else
+                       self.terminal_single_pick(state, self.config.actor_relation_chunk_size)
+                       if self.config.terminal_profit_override else
+                       torch.zeros(p.shape[0], dtype=torch.bool, device=p.device))
+        effective_gate = (torch.where(single_pick, torch.zeros_like(theta.efficiency_gate), theta.efficiency_gate)
+                          if self.config.terminal_profit_override else theta.efficiency_gate)
+        gate = effective_gate[owners]
+        base = profit_term - gate * resource_cost
+        effective_penalty = gate * penalty
+        scores = base - effective_penalty + bonus
         return CandidatePolicy(owners, items, scores / theta.temperature[owners], p.shape[0],
-                               dict(base=base, interaction_penalty=penalty, companion_bonus=bonus, score=scores))
+                               dict(base=base, interaction_penalty=effective_penalty, companion_bonus=bonus,
+                                    resource_cost=resource_cost + penalty, profit=profit_term,
+                                    efficiency_gate=theta.efficiency_gate[owners], effective_efficiency_gate=gate,
+                                    terminal_single_pick=single_pick[owners], score=scores))
 
 
 class MKPModel(nn.Module):

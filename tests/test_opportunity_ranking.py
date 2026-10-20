@@ -38,7 +38,7 @@ class OpportunityTests(unittest.TestCase):
         torch.manual_seed(41)
         torch.set_num_threads(2)
         self.config = ModelConfig(embed_dim=16, num_heads=4, num_layers=1)
-        self.train = TrainConfig(ranking_states=2, ranking_pool_size=4, ranking_repeats=2,
+        self.train = TrainConfig(supervision_mode="legacy", ranking_states=2, ranking_pool_size=4, ranking_repeats=2,
                                  ppo_epochs=1, minibatch_size=4, device="cpu")
 
     def test_similar_items_flip_towards_preserved_future_item(self):
@@ -102,6 +102,7 @@ class OpportunityTests(unittest.TestCase):
         model = MKPModel(config)
         state = critical_state()
         theta = model.actor(state)[0]
+        theta.efficiency_gate = torch.ones_like(theta.efficiency_gate)
         with patch.object(model.decoder, "opportunity_features", side_effect=AssertionError("disabled")):
             actual = model.decoder(state, theta)
         torch.testing.assert_close(actual.logits, model.decoder(state, model.decoder.fixed_theta(state)).logits)
@@ -308,7 +309,7 @@ class OpportunityTests(unittest.TestCase):
         self.assertEqual(train.ranking_states, 8)
         self.assertEqual(model.opportunity_weight_max, 0)
         self.assertFalse(model.actor_edge_values)
-        trainer.return_value.train.assert_called_once_with(None)
+        trainer.return_value.train.assert_called_once_with(None, warm_start=None)
 
 
 if __name__ == "__main__":

@@ -13,18 +13,19 @@ import time
 import numpy as np
 import torch
 from torch.nn import functional as F
-from mkp_config import (CHECKPOINT_VERSION, CONTROLLER_VERSION, DECODER_VERSION, ModelConfig, GeneratorConfig,
+from mkp_config import (CHECKPOINT_VERSION, CONTROLLER_VERSION, DECODER_VERSION, TRAINING_SUPERVISION_VERSION, ModelConfig, GeneratorConfig,
                         TrainConfig, config_dict)
 from mkp_data import synthetic_batch
 from mkp_env import MKPEnv, MKPState
 from mkp_Model import MKPModel
-from mkp_basis import COMBINATION_METRICS, decoder_statistics
+from mkp_basis import COMBINATION_METRICS, GATE_METRICS, decoder_statistics, gate_statistics
 from mkp_ranking import collect_ranking_batch, ranking_objective, ranking_kl
+from mkp_imitation import TeacherTrainer, TEACHER_METRICS, empty_teacher_metrics
 from mkp_performance import (GIB, PERFORMANCE_FIELDS, configure_training_runtime,
                              build_rollout_cache, prepare_state)
 from mkp_diagnostics import convergence_report, plot_training, prepare_plotting
 from mkp_utils import (atomic_checkpoint, construct_solution, load_checkpoint, resolve_device,
-                       seed_everything, write_json)
+                       seed_everything, write_json, warm_start_checkpoint)
 
 
 def generalized_advantage(rewards, values, dones, active, gamma, gae_lambda):
@@ -48,6 +49,7 @@ def collect_rollout(model, data):
                                   "values", "rewards", "dones", "active")}
     model.eval()  # no dropout anywhere: collection and PPO recomputation agree
     combination_sum = data[0].new_zeros(len(COMBINATION_METRICS), dtype=torch.float32)
+    gate_sum = data[0].new_zeros(len(GATE_METRICS), dtype=torch.float32)
     transition_count = data[0].new_zeros((), dtype=torch.float32)
     for _ in range(data[0].shape[1]):
         active = env.state.active
@@ -56,6 +58,7 @@ def collect_rollout(model, data):
         policy, value, theta, _ = model(env.state)
         combination = torch.cat((theta.statistics()[:, -2:], decoder_statistics(policy)), -1)
         combination_sum += (combination * active[:, None]).sum(0)
+        gate_sum += (gate_statistics(policy) * active[:, None]).sum(0)
         transition_count += active.sum()
         actions = policy.choose(stochastic=True)
         records["remaining"].append(env.state.remaining.clone())
@@ -76,6 +79,7 @@ def collect_rollout(model, data):
     result["utilization"] = (1 - env.state.remaining / env.state.capacities).mean()
     result["combination_metrics"] = dict(zip(COMBINATION_METRICS,
                                               (combination_sum / transition_count.clamp_min(1)).tolist()))
+    result["gate_metrics"] = dict(zip(GATE_METRICS, (gate_sum / transition_count.clamp_min(1)).tolist()))
     return result
 
 
@@ -105,20 +109,25 @@ class MKPTrainer:
                         "ranking_standard_error", "ranking_label_seconds", "ranking_loss",
                         "ranking_accuracy", "ranking_kl", "ranking_minibatches"]
         self.fields += list(COMBINATION_METRICS)
+        self.fields += list(GATE_METRICS)
         self.fields += list(PERFORMANCE_FIELDS)
+        self.fields += list(TEACHER_METRICS)
         with (self.run_dir / "metrics.csv").open("w", newline="", encoding="utf-8") as f:
             csv.DictWriter(f, fieldnames=self.fields).writeheader()
         write_json(self.run_dir / "config.json", {
             "train": config_dict(self.config), "model": config_dict(self.model_config),
             "generator": config_dict(self.generator_config), "torch": str(torch.__version__),
-            "device": str(self.device), "training_data_source": "synthetic_only"})
+            "device": str(self.device), "training_data_source": "synthetic_only",
+            "training_supervision_version": TRAINING_SUPERVISION_VERSION})
 
     def ppo_update(self, model, optimizer, data, rollout, update=0):
         c = self.config
         # No parameter update has occurred since collection: this is the frozen
         # behavior policy. Branches never enter the PPO buffer or critic targets.
-        ranking, ranking_stats = collect_ranking_batch(model, data, rollout, c,
-            seed=c.seed + 1000003 * update + data[2].shape[-1])
+        ranking, ranking_stats = (collect_ranking_batch(model, data, rollout, c,
+            seed=c.seed + 1000003 * update + data[2].shape[-1]) if c.supervision_mode == "legacy"
+            else (None, dict(ranking_proposed=0, ranking_pairs=0, ranking_abs_return_gap=0.,
+                            ranking_standard_error=0., ranking_label_seconds=0.)))
         advantages, returns = generalized_advantage(rollout["rewards"], rollout["values"],
             rollout["dones"], rollout["active"], c.gamma, c.gae_lambda)
         times, batches = rollout["active"].nonzero(as_tuple=True)
@@ -179,8 +188,14 @@ class MKPTrainer:
                     raise FloatingPointError("Non-finite PPO loss")
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), c.max_grad_norm,
-                                                          error_if_nonfinite=True)
+                # Independent encoders also receive independent clipping budgets.
+                # A large critic gradient must not rescale the actor's direction.
+                actor_norm = torch.nn.utils.clip_grad_norm_(model.actor.parameters(), c.max_grad_norm,
+                                                            error_if_nonfinite=True)
+                critic_norm = torch.nn.utils.clip_grad_norm_(
+                    list(model.critic_encoder.parameters()) + list(model.value_head.parameters()),
+                    c.max_grad_norm, error_if_nonfinite=True)
+                grad_norm = torch.maximum(actor_norm, critic_norm)
                 optimizer.step()
                 if ranking is not None:
                     ranking_sums += torch.stack((rank_loss.detach(), rank_accuracy.detach()))
@@ -207,19 +222,30 @@ class MKPTrainer:
         result.update(cache_stats, ppo_seconds=time.perf_counter() - ppo_began)
         return result
 
-    def train(self, resume=None):
-        if resume is not None and len(self.config.num_resources) != 1:
-            raise ValueError("--resume requires exactly one --resources value")
+    def train(self, resume=None, warm_start=None):
         try:
+            if resume is not None and warm_start is not None:
+                raise ValueError("--resume and --warm-start are mutually exclusive")
+            if resume is not None and len(self.config.num_resources) != 1:
+                raise ValueError("--resume requires exactly one --resources value")
+            if warm_start is not None:
+                source = Path(warm_start)
+                if not source.is_dir() and len(self.config.num_resources) != 1:
+                    raise ValueError("A warm-start file requires one --resources value; use a directory for multiple M")
+                source_dir = source if source.is_dir() else source.parent
+                if source_dir.resolve() == self.config.checkpoint_dir.resolve():
+                    raise ValueError("Warm start must use a different checkpoint directory to preserve its source")
             prepare_plotting()
             for m in self.config.num_resources:
-                self._train_shape(m, resume)
+                source = (Path(warm_start) / f"mkp_M{m}_best.pt"
+                          if warm_start is not None and Path(warm_start).is_dir() else warm_start)
+                self._train_shape(m, resume, source)
         finally:
             for handler in self.logger.handlers[:]:
                 handler.close()
                 self.logger.removeHandler(handler)
 
-    def _train_shape(self, m, resume):
+    def _train_shape(self, m, resume, warm_start=None):
         c = self.config
         seed_everything(c.seed + m, c.deterministic, c.cpu_threads)
         rng = np.random.default_rng(c.seed + m)
@@ -228,14 +254,24 @@ class MKPTrainer:
         start, best = 1, -float("inf")
         history = []
         saved = None
+        initialization = {"mode": "fresh"}
+        if warm_start:
+            model, initialization = warm_start_checkpoint(warm_start, self.model_config, self.device, m)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=c.learning_rate, weight_decay=0.0)
+            write_json(self.run_dir / f"initialization_M{m}.json", initialization)
+            self.logger.info("M=%d WARM_START | %s", m, initialization)
         if resume:
             model, saved = load_checkpoint(resume, self.device, m)
             if saved["model_config"] != config_dict(self.model_config):
                 raise ValueError("Resume model config differs; supply the original model settings")
             if saved["generator_config"] != config_dict(self.generator_config):
                 raise ValueError("Resume generator config differs")
+            if saved.get("training_supervision_version") != TRAINING_SUPERVISION_VERSION:
+                raise ValueError("Resume training supervision differs; start a separate experiment")
             old = saved["train_config"]
-            for key in ("train_num_items", "validation_seed", "validation_instances_per_shape", "seed"):
+            stable_fields = ("train_num_items", "validation_seed", "validation_instances_per_shape", "seed",
+                             "supervision_mode") + tuple(k for k in config_dict(c) if k.startswith("teacher_"))
+            for key in stable_fields:
                 if old[key] != config_dict(c)[key]:
                     raise ValueError(f"Resume requires unchanged {key}")
             optimizer = torch.optim.AdamW(model.parameters(), lr=c.learning_rate, weight_decay=0.0)
@@ -244,6 +280,7 @@ class MKPTrainer:
                 group["lr"] = c.learning_rate
             start, best = saved["update"] + 1, saved["best_validation_return"]
             history = saved.get("diagnostics_history", [])
+            initialization = saved.get("training_initialization", {"mode": "fresh"})
             if not history:
                 self.logger.warning("M=%d resume checkpoint has no diagnostics history; convergence evidence starts at update=%d",
                                     m, start)
@@ -252,12 +289,48 @@ class MKPTrainer:
         runtime = configure_training_runtime(model, c, self.device)
         write_json(self.run_dir / f"runtime_M{m}.json", runtime)
         self.logger.info("M=%d RUNTIME | %s", m, runtime)
+        teacher = TeacherTrainer(model, c) if c.supervision_mode == "teacher" and c.teacher_steps else None
+        if saved and teacher is not None:
+            if saved.get("teacher_state") is None:
+                raise ValueError("Resume is missing teacher optimizer/replay state")
+            teacher.load_state_dict(saved["teacher_state"])
         # Fixed held-out synthetic validation has an independent RNG and only training N shapes.
         vrng = np.random.default_rng(c.validation_seed + m)
         validation = [synthetic_batch(c.validation_instances_per_shape, n, m, self.generator_config,
                                      vrng, self.device) for n in c.train_num_items]
         fixed_objectives = [construct_solution(data, mode="fixed", model_config=self.model_config)["objective"]
                             for data in validation]
+        def checkpoint_payload(update):
+            return {"checkpoint_version": CHECKPOINT_VERSION, "decoder_version": DECODER_VERSION,
+                    "controller_version": CONTROLLER_VERSION,
+                    "model_config": config_dict(self.model_config), "train_config": config_dict(c),
+                    "generator_config": config_dict(self.generator_config), "num_resources": m,
+                    "training_data_source": "synthetic_only", "update": update,
+                    "diagnostics_history": history, "training_runtime": runtime,
+                    "training_initialization": initialization,
+                    "training_supervision_version": TRAINING_SUPERVISION_VERSION,
+                    "teacher_state": teacher.state_dict() if teacher is not None else None,
+                    "best_validation_return": best, "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(), "numpy_generator_state": rng.bit_generator.state,
+                    "torch_rng_state": torch.get_rng_state(),
+                    "cuda_rng_state": torch.cuda.get_rng_state_all() if self.device.type == "cuda" else [],
+                    "run_dir": str(self.run_dir), "torch_version": str(torch.__version__)}
+
+        if warm_start:
+            # Make the transferred policy eligible for best selection. Otherwise
+            # the first fine-tuning update could overwrite it after a regression.
+            objectives = [construct_solution(data, model)["objective"] for data in validation]
+            best = torch.cat([obj / data[0].sum(-1) for obj, data in zip(objectives, validation)]).mean().item()
+            improvement = torch.cat([100 * (obj - ref) / ref.clamp_min(1)
+                                     for obj, ref in zip(objectives, fixed_objectives)]).mean().item()
+            history.append(dict(M=m, update=0, validation_return=best, best_validation_return=best,
+                                validation_improvement_pct=improvement, elapsed_seconds=0.))
+            with (self.run_dir / "metrics.csv").open("a", newline="", encoding="utf-8") as stream:
+                csv.DictWriter(stream, fieldnames=self.fields).writerow(history[-1])
+            payload = checkpoint_payload(0)
+            for tag in ("initial", "best", "last"):
+                atomic_checkpoint(c.checkpoint_dir / f"mkp_M{m}_{tag}.pt", payload)
+            self.logger.info("M=%d INITIAL_VALIDATION | update=0 return=%.8f; saved initial policy as best", m, best)
         if saved:
             rng.bit_generator.state = saved["numpy_generator_state"]
             torch.set_rng_state(saved["torch_rng_state"])
@@ -282,6 +355,8 @@ class MKPTrainer:
             rollout = collect_rollout(model, data)
             rollout_seconds = time.perf_counter() - rollout_began
             stats = self.ppo_update(model, optimizer, data, rollout, update)
+            # A separate actor phase, even if PPO stopped early on its own KL.
+            stats.update(teacher.update(data, rollout, update) if teacher is not None else empty_teacher_metrics())
             stats.update(rollout_seconds=rollout_seconds,
                          gpu_peak_allocated_gib=(torch.cuda.max_memory_allocated(self.device) / GIB
                                                  if self.device.type == "cuda" else 0.),
@@ -300,6 +375,7 @@ class MKPTrainer:
                        objective_mean=rollout["objective"].mean().item(),
                        normalized_return=(rollout["objective"] / data[0].sum(-1)).mean().item(),
                        utilization=rollout["utilization"].item(), **stats, **rollout.get("combination_metrics", {}),
+                       **rollout.get("gate_metrics", {}),
                        validation_return=validation_return, validation_improvement_pct=improvement,
                        best_validation_return=best, elapsed_seconds=time.perf_counter() - began)
             history.append(row)
@@ -324,6 +400,15 @@ class MKPTrainer:
                              m, update, stats["rollout_seconds"], stats.get("ranking_label_seconds", 0.),
                              stats["ppo_seconds"], stats["feature_cache_gib"], stats["feature_cache_seconds"],
                              stats["gpu_peak_allocated_gib"], stats["gpu_peak_reserved_gib"])
+            if stats["teacher_labeled"] or stats["teacher_updates"] or stats["teacher_rejected"]:
+                self.logger.info("M=%d update=%d TEACHER | labels=%d exact=%d optimal=%d incumbent=%d "
+                                 "accepted=%d rejected=%d safe=%.3f->%.3f exact_regret=%.6f->%.6f "
+                                 "guard=%d exact_Q_rows=%d replay=%d seconds=%.2f",
+                                 m, update, *(stats[key] for key in ("teacher_labeled", "teacher_exact",
+                                 "teacher_optimal", "teacher_incumbent", "teacher_updates", "teacher_rejected",
+                                 "teacher_safe_before", "teacher_safe_after", "teacher_regret_before",
+                                 "teacher_regret_after", "teacher_guard_states", "teacher_exact_guard_states",
+                                 "teacher_replay_size", "teacher_seconds")))
             if validation_return is not None:
                 report = convergence_report(history, c)
                 plateau = (report["plateau_start_update"], report["confirmation_update"])
@@ -334,17 +419,7 @@ class MKPTrainer:
                                      m, update, report["status"], *plateau)
                 previous_plateau = plateau
             if improved or update % c.checkpoint_every == 0 or update == c.updates:
-                payload = {"checkpoint_version": CHECKPOINT_VERSION, "decoder_version": DECODER_VERSION,
-                           "controller_version": CONTROLLER_VERSION,
-                           "model_config": config_dict(self.model_config), "train_config": config_dict(c),
-                           "generator_config": config_dict(self.generator_config), "num_resources": m,
-                           "training_data_source": "synthetic_only", "update": update,
-                           "diagnostics_history": history, "training_runtime": runtime,
-                           "best_validation_return": best, "model_state": model.state_dict(),
-                           "optimizer_state": optimizer.state_dict(), "numpy_generator_state": rng.bit_generator.state,
-                           "torch_rng_state": torch.get_rng_state(),
-                           "cuda_rng_state": torch.cuda.get_rng_state_all() if self.device.type == "cuda" else [],
-                           "run_dir": str(self.run_dir), "torch_version": str(torch.__version__)}
+                payload = checkpoint_payload(update)
                 atomic_checkpoint(c.checkpoint_dir / f"mkp_M{m}_last.pt", payload)
                 if improved:
                     atomic_checkpoint(c.checkpoint_dir / f"mkp_M{m}_best.pt", payload)
@@ -378,20 +453,33 @@ def main(argv=None):
     parser.add_argument("--cache-headroom-gib", type=float, default=defaults.cache_headroom_gib)
     parser.add_argument("--feature-cache-batch-size", type=int, default=defaults.feature_cache_batch_size)
     parser.add_argument("--seed", type=int, default=defaults.seed)
-    parser.add_argument("--resume", default=None)
+    initialization = parser.add_mutually_exclusive_group()
+    initialization.add_argument("--resume", default=None)
+    initialization.add_argument("--warm-start", type=Path, default=None,
+                                help="Original v5/v8 file or directory of mkp_M*_best.pt; new optimizer/run")
     parser.add_argument("--checkpoint-dir", type=Path, default=defaults.checkpoint_dir)
     parser.add_argument("--runs-dir", type=Path, default=defaults.runs_dir)
     parser.add_argument("--ranking-coefficient", type=float, default=defaults.ranking_coefficient)
     parser.add_argument("--ranking-states", type=int, default=defaults.ranking_states)
     parser.add_argument("--ranking-pool-size", type=int, default=defaults.ranking_pool_size)
     parser.add_argument("--ranking-repeats", type=int, default=defaults.ranking_repeats)
+    parser.add_argument("--supervision-mode", choices=("teacher", "legacy"), default=defaults.supervision_mode)
+    for field in ("teacher_every", "teacher_states", "teacher_steps", "teacher_minibatch_size",
+                  "teacher_replay_size", "teacher_plan_prefixes", "teacher_exact_items", "teacher_node_limit"):
+        parser.add_argument("--" + field.replace("_", "-"), type=int, default=getattr(defaults, field))
+    for field in ("teacher_learning_rate", "teacher_score_scale", "teacher_max_kl", "teacher_max_grad_norm",
+                  "teacher_time_limit", "teacher_mip_rel_gap"):
+        parser.add_argument("--" + field.replace("_", "-"), type=float, default=getattr(defaults, field))
+    parser.add_argument("--efficiency-gate-initial", type=float, default=model_defaults.efficiency_gate_initial)
+    parser.add_argument("--terminal-profit-override", action=argparse.BooleanOptionalAction,
+                        default=model_defaults.terminal_profit_override)
     parser.add_argument("--opportunity-weight-max", type=float, default=model_defaults.opportunity_weight_max)
     parser.add_argument("--reserve-weight-max", type=float, default=model_defaults.reserve_weight_max)
     parser.add_argument("--opportunity-tokens", type=int, default=model_defaults.opportunity_tokens)
     parser.add_argument("--actor-edge-values", action=argparse.BooleanOptionalAction,
                         default=model_defaults.actor_edge_values)
     for field in ("actor_postdecision_features", "actor_pair_attention", "actor_contrast_pooling",
-                  "actor_feasible_attention"):
+                  "actor_feasible_attention", "actor_resource_geometry", "controller_resource_readout"):
         parser.add_argument("--" + field.replace("_", "-"), action=argparse.BooleanOptionalAction,
                             default=getattr(model_defaults, field))
     parser.add_argument("--actor-relation-chunk-size", type=int, default=model_defaults.actor_relation_chunk_size)
@@ -410,7 +498,9 @@ def main(argv=None):
                          ranking_states=args.ranking_states, ranking_pool_size=args.ranking_pool_size,
                          ranking_repeats=args.ranking_repeats, performance_profile=args.performance_profile,
                          feature_cache_gib=args.feature_cache_gib, cache_headroom_gib=args.cache_headroom_gib,
-                         feature_cache_batch_size=args.feature_cache_batch_size)
+                         feature_cache_batch_size=args.feature_cache_batch_size,
+                         supervision_mode=args.supervision_mode,
+                         **{field: getattr(args, field) for field in config_dict(defaults) if field.startswith("teacher_")})
     model = ModelConfig(opportunity_weight_max=args.opportunity_weight_max,
                         reserve_weight_max=args.reserve_weight_max, opportunity_tokens=args.opportunity_tokens,
                         actor_edge_values=args.actor_edge_values,
@@ -418,6 +508,10 @@ def main(argv=None):
                         actor_pair_attention=args.actor_pair_attention,
                         actor_contrast_pooling=args.actor_contrast_pooling,
                         actor_feasible_attention=args.actor_feasible_attention,
+                        actor_resource_geometry=args.actor_resource_geometry,
+                        controller_resource_readout=args.controller_resource_readout,
+                        efficiency_gate_initial=args.efficiency_gate_initial,
+                        terminal_profit_override=args.terminal_profit_override,
                         actor_relation_chunk_size=args.actor_relation_chunk_size,
                         actor_relation_bandwidth=args.actor_relation_bandwidth,
                         actor_similarity_bandwidth=args.actor_similarity_bandwidth,
@@ -425,4 +519,4 @@ def main(argv=None):
                         companion_weight_max=args.companion_weight_max,
                         combination_initial_weight=args.combination_initial_weight,
                         companion_scales=tuple(args.companion_scales), combination_chunk_size=args.combination_chunk_size)
-    MKPTrainer(config, model).train(args.resume)
+    MKPTrainer(config, model).train(args.resume, warm_start=args.warm_start)

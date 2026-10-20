@@ -4,9 +4,10 @@ import math
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-CHECKPOINT_VERSION = 5
-CONTROLLER_VERSION = "combination_theta_v5"
-DECODER_VERSION = "second_order_density_v5"
+CHECKPOINT_VERSION = 9
+CONTROLLER_VERSION = "resource_aware_efficiency_v9"
+DECODER_VERSION = "gated_resource_density_v9"
+TRAINING_SUPERVISION_VERSION = "synthetic_residual_teacher_v1"
 
 @dataclass
 class TrainConfig:
@@ -38,6 +39,23 @@ class TrainConfig:
     ranking_return_scale: float = 0.02
     ranking_score_scale: float = 0.2
     ranking_greedy_weight: float = 0.5
+    # The default actor teacher is a separate post-PPO phase on synthetic states.
+    # Legacy paired-ranking remains an explicit comparison, never run together.
+    supervision_mode: str = "teacher"
+    teacher_every: int = 5
+    teacher_states: int = 8
+    teacher_steps: int = 4
+    teacher_minibatch_size: int = 8
+    teacher_replay_size: int = 256
+    teacher_learning_rate: float = 5e-5
+    teacher_score_scale: float = 0.1
+    teacher_max_kl: float = 0.05
+    teacher_max_grad_norm: float = 1.0
+    teacher_plan_prefixes: int = 4
+    teacher_exact_items: int = 16
+    teacher_time_limit: float = 1.0
+    teacher_node_limit: int = 1000
+    teacher_mip_rel_gap: float = 0.0
     validation_every: int = 25
     validation_instances_per_shape: int = 64
     checkpoint_every: int = 100
@@ -58,7 +76,7 @@ class TrainConfig:
     cache_headroom_gib: float = 6.0
     feature_cache_batch_size: int = 64
     runs_dir: Path = field(default_factory=lambda: ROOT / "runs")
-    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / "combination_v5")
+    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / "decision_teacher_v9")
 
     def __post_init__(self):
         counts = (self.updates, self.batch_size, self.minibatch_size, self.ppo_epochs,
@@ -100,6 +118,19 @@ class TrainConfig:
         if not all(math.isfinite(x) for x in (self.ranking_coefficient, self.ranking_min_gap,
                 self.ranking_se_multiplier, self.ranking_return_scale, self.ranking_score_scale)):
             raise ValueError("Ranking loss settings must be finite")
+        if self.supervision_mode not in ("teacher", "legacy"):
+            raise ValueError("supervision_mode must be teacher or legacy")
+        if min(self.teacher_every, self.teacher_states, self.teacher_minibatch_size,
+               self.teacher_replay_size, self.teacher_node_limit) < 1:
+            raise ValueError("Teacher counts must be positive")
+        if self.teacher_steps < 0 or self.teacher_plan_prefixes < 0 or not 0 <= self.teacher_exact_items <= 18:
+            raise ValueError("Teacher steps/prefixes must be nonnegative and exact items in [0,18]")
+        if not all(math.isfinite(x) and x > 0 for x in (self.teacher_learning_rate,
+                self.teacher_score_scale, self.teacher_max_kl, self.teacher_max_grad_norm,
+                self.teacher_time_limit)):
+            raise ValueError("Teacher rates, scales, KL, norm and time limit must be positive and finite")
+        if not math.isfinite(self.teacher_mip_rel_gap) or self.teacher_mip_rel_gap < 0:
+            raise ValueError("Teacher mip gap must be finite and nonnegative")
         self.runs_dir, self.checkpoint_dir = Path(self.runs_dir), Path(self.checkpoint_dir)
 
 
@@ -124,6 +155,11 @@ class ModelConfig:
     actor_pair_attention: bool = True
     actor_contrast_pooling: bool = True
     actor_feasible_attention: bool = True
+    # Actor-only resource residual paths, followed by one state-level cost gate.
+    actor_resource_geometry: bool = True
+    controller_resource_readout: bool = True
+    efficiency_gate_initial: float = 0.95
+    terminal_profit_override: bool = True
     actor_relation_chunk_size: int = 32
     actor_relation_bandwidth: float = 0.05
     actor_similarity_bandwidth: float = 0.1
@@ -141,6 +177,8 @@ class ModelConfig:
     eps: float = 1e-8
 
     def __post_init__(self):
+        if not math.isfinite(self.efficiency_gate_initial) or not 0 < self.efficiency_gate_initial < 1:
+            raise ValueError("efficiency_gate_initial must lie in (0,1)")
         if self.embed_dim < 1 or self.num_heads < 1 or self.embed_dim % self.num_heads:
             raise ValueError("embed_dim must be positive and divisible by num_heads")
         if self.num_layers < 1 or self.ff_multiplier < 1:
@@ -205,7 +243,7 @@ class BenchmarkConfig:
     dataset: Path = field(default_factory=lambda: ROOT / "MKP_dataset" / "Benchmarks_Chu.mat")
     num_resources: tuple[int, ...] = (5, 10)
     num_items: tuple[int, ...] = (100, 250, 500)
-    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / "combination_v5")
+    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / "decision_teacher_v9")
     results_dir: Path = field(default_factory=lambda: ROOT / "results")
     checkpoint_tag: str = "best"
     device: str = "auto"
