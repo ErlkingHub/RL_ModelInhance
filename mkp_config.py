@@ -58,7 +58,7 @@ class TrainConfig:
     cache_headroom_gib: float = 6.0
     feature_cache_batch_size: int = 64
     runs_dir: Path = field(default_factory=lambda: ROOT / "runs")
-    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / "combination_v5")
+    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / "resource_routing_v1")
 
     def __post_init__(self):
         counts = (self.updates, self.batch_size, self.minibatch_size, self.ppo_epochs,
@@ -109,6 +109,9 @@ class ModelConfig:
     num_heads: int = 8
     num_layers: int = 2
     ff_multiplier: int = 4
+    # Actor architecture is checkpointed independently of the unchanged v5 theta.
+    actor_encoder: str = "resource_routing_v1"
+    actor_strategy_readout: bool = True
     # No positional embeddings: item/resource order must not encode identity.
     price_floor: float = 0.05
     profit_exponent_min: float = 0.5
@@ -141,6 +144,8 @@ class ModelConfig:
     eps: float = 1e-8
 
     def __post_init__(self):
+        if self.actor_encoder not in ("legacy", "resource_routing_v1"):
+            raise ValueError("actor_encoder must be legacy or resource_routing_v1")
         if self.embed_dim < 1 or self.num_heads < 1 or self.embed_dim % self.num_heads:
             raise ValueError("embed_dim must be positive and divisible by num_heads")
         if self.num_layers < 1 or self.ff_multiplier < 1:
@@ -180,6 +185,14 @@ class ModelConfig:
         if self.combination_chunk_size < 1:
             raise ValueError("combination_chunk_size must be positive")
 
+    @classmethod
+    def from_checkpoint(cls, values):
+        # Missing architecture fields identify the original v5 model, never new defaults.
+        values = dict(values)
+        values.setdefault("actor_encoder", "legacy")
+        values.setdefault("actor_strategy_readout", False)
+        return cls(**values)
+
 
 @dataclass
 class GeneratorConfig:
@@ -205,7 +218,7 @@ class BenchmarkConfig:
     dataset: Path = field(default_factory=lambda: ROOT / "MKP_dataset" / "Benchmarks_Chu.mat")
     num_resources: tuple[int, ...] = (5, 10)
     num_items: tuple[int, ...] = (100, 250, 500)
-    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / "combination_v5")
+    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / "resource_routing_v1")
     results_dir: Path = field(default_factory=lambda: ROOT / "results")
     checkpoint_tag: str = "best"
     device: str = "auto"

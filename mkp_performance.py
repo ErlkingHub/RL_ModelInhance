@@ -17,7 +17,7 @@ def state_stamp(state):
 def feature_signature(config):
     # Chunk sizes affect execution only. All feature-defining settings belong here.
     return tuple(getattr(config, name) for name in (
-        "eps", "feature_clip", "actor_postdecision_features", "actor_pair_attention",
+        "eps", "feature_clip", "actor_encoder", "actor_postdecision_features", "actor_pair_attention",
         "actor_contrast_pooling", "actor_relation_bandwidth", "opportunity_weight_max",
         "reserve_weight_max", "opportunity_bandwidth", "interaction_weight_max",
         "companion_weight_max", "companion_scales"))
@@ -61,7 +61,12 @@ def prepare_state(state, config):
     state._prepared = None
     payload = dict(zip(("item", "resource", "edge", "global"), state_features(state, config)))
     payload["feasible"] = state.feasible
-    if config.actor_postdecision_features or config.actor_pair_attention or config.actor_contrast_pooling:
+    if config.actor_encoder == "resource_routing_v1":
+        from mkp_routing import routing_geometry
+        from dataclasses import fields
+        geometry = routing_geometry(state, config)
+        payload.update({"routing_" + field.name: getattr(geometry, field.name) for field in fields(geometry)})
+    elif config.actor_postdecision_features or config.actor_pair_attention or config.actor_contrast_pooling:
         relations = candidate_relations(state, config)
         for name in ("pairs", "valid", "post", "resource_post"):
             payload["relation_" + name] = getattr(relations, name)

@@ -230,7 +230,7 @@ class MKPTrainer:
         saved = None
         if resume:
             model, saved = load_checkpoint(resume, self.device, m)
-            if saved["model_config"] != config_dict(self.model_config):
+            if config_dict(ModelConfig.from_checkpoint(saved["model_config"])) != config_dict(self.model_config):
                 raise ValueError("Resume model config differs; supply the original model settings")
             if saved["generator_config"] != config_dict(self.generator_config):
                 raise ValueError("Resume generator config differs")
@@ -388,6 +388,13 @@ def main(argv=None):
     parser.add_argument("--opportunity-weight-max", type=float, default=model_defaults.opportunity_weight_max)
     parser.add_argument("--reserve-weight-max", type=float, default=model_defaults.reserve_weight_max)
     parser.add_argument("--opportunity-tokens", type=int, default=model_defaults.opportunity_tokens)
+    parser.add_argument("--actor-encoder", choices=("legacy", "resource_routing_v1"),
+                        default=model_defaults.actor_encoder)
+    parser.add_argument("--actor-strategy-readout", action=argparse.BooleanOptionalAction,
+                        default=model_defaults.actor_strategy_readout)
+    parser.add_argument("--embed-dim", type=int, default=model_defaults.embed_dim)
+    parser.add_argument("--num-heads", type=int, default=model_defaults.num_heads)
+    parser.add_argument("--num-layers", type=int, default=model_defaults.num_layers)
     parser.add_argument("--actor-edge-values", action=argparse.BooleanOptionalAction,
                         default=model_defaults.actor_edge_values)
     for field in ("actor_postdecision_features", "actor_pair_attention", "actor_contrast_pooling",
@@ -412,6 +419,8 @@ def main(argv=None):
                          feature_cache_gib=args.feature_cache_gib, cache_headroom_gib=args.cache_headroom_gib,
                          feature_cache_batch_size=args.feature_cache_batch_size)
     model = ModelConfig(opportunity_weight_max=args.opportunity_weight_max,
+                        actor_encoder=args.actor_encoder, actor_strategy_readout=args.actor_strategy_readout,
+                        embed_dim=args.embed_dim, num_heads=args.num_heads, num_layers=args.num_layers,
                         reserve_weight_max=args.reserve_weight_max, opportunity_tokens=args.opportunity_tokens,
                         actor_edge_values=args.actor_edge_values,
                         actor_postdecision_features=args.actor_postdecision_features,

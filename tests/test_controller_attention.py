@@ -23,6 +23,7 @@ class ControllerAttentionTests(unittest.TestCase):
         torch.manual_seed(29)
         torch.set_num_threads(2)
         self.config = ModelConfig(embed_dim=16, num_heads=4, num_layers=1,
+                                  actor_encoder="legacy", actor_strategy_readout=False,
                                   actor_relation_chunk_size=2)
 
     def test_near_equal_items_have_different_future_and_resource_features(self):
@@ -204,7 +205,7 @@ class ControllerAttentionTests(unittest.TestCase):
                   "--actor-relation-chunk-size", "3", "--actor-relation-bandwidth", ".07",
                   "--actor-similarity-bandwidth", ".2"])
         train, config = trainer.call_args.args
-        self.assertEqual(train.checkpoint_dir.name, "combination_v5")
+        self.assertEqual(train.checkpoint_dir.name, "resource_routing_v1")
         self.assertFalse(config.actor_postdecision_features or config.actor_pair_attention
                          or config.actor_contrast_pooling or config.actor_feasible_attention)
         self.assertEqual(config.actor_relation_chunk_size, 3)

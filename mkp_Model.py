@@ -15,6 +15,7 @@ from mkp_performance import cached_features, prepare_state
 from mkp_attention import (POST_DIM, RESOURCE_POST_DIM, candidate_relations,
                            PairRelationAttention, CriticalContrastPool, CandidateRelations,
                            masked_softmax, safe_key_padding_mask)
+from mkp_routing import ResourceRoutingEncoder, StrategyRoleReadout
 
 
 def state_features(state: MKPState, config: ModelConfig):
@@ -201,7 +202,9 @@ class HighLevelController(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
-        self.encoder = BipartiteEncoder(config, strategy=True)
+        self.encoder = (ResourceRoutingEncoder(config) if config.actor_encoder == "resource_routing_v1"
+                        else BipartiteEncoder(config, strategy=True))
+        self.role_readout = StrategyRoleReadout(config) if config.actor_strategy_readout else None
         # A linear concatenation makes the shared pooled term cancel in softmax.
         self.price_context = nn.Sequential(nn.Linear(3 * config.embed_dim, config.embed_dim), nn.GELU())
         self.price_head = nn.Linear(config.embed_dim, 1, bias=False)
@@ -225,12 +228,19 @@ class HighLevelController(nn.Module):
         items, resources, pooled = self.encoder(state)
         c = self.config
         m = resources.shape[1]
-        global_context = pooled[:, None, :].expand_as(resources)
+        roles = (None if self.role_readout is None else
+                 self.role_readout(items, resources, pooled, state.feasible))
+        price_context = pooled if roles is None else roles[:, 6]
+        global_context = price_context[:, None, :].expand_as(resources)
         price_logits = self.price_head(self.price_context(torch.cat(
             (resources, global_context, resources * global_context), -1))).squeeze(-1)
         prices = c.price_floor + (1 - c.price_floor) * m * price_logits.softmax(-1)
-        controls = self.strategy_head(pooled).sigmoid()
-        interaction, companion = self.combination_head(resources, pooled)
+        control_logits = (self.strategy_head(pooled) if roles is None else
+                          (roles[:, :6] * self.strategy_head.weight[None]).sum(-1)
+                          + self.strategy_head.bias)
+        controls = control_logits.sigmoid()
+        interaction, companion = self.combination_head(resources,
+            pooled if roles is None else roles[:, 7], None if roles is None else roles[:, 8])
         theta = StrategyTheta(
             prices,
             c.profit_exponent_min + (c.profit_exponent_max - c.profit_exponent_min) * controls[:, 0],

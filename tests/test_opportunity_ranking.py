@@ -175,7 +175,8 @@ class OpportunityTests(unittest.TestCase):
         torch.testing.assert_close(first, second, atol=1e-6, rtol=1e-5)
 
     def test_rank_gradient_reaches_controller_and_not_critic(self):
-        model = MKPModel(self.config)
+        # This check names original Actor modules; routing gradients have their own contract.
+        model = MKPModel(replace(self.config, actor_encoder="legacy", actor_strategy_readout=False))
         with torch.no_grad():
             model.actor.price_head.weight.normal_(0, .1)
             model.actor.strategy_head.weight.normal_(0, .1)
