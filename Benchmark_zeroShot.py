@@ -10,6 +10,9 @@ import numpy as np
 import torch
 from mkp_config import BenchmarkConfig, config_dict
 from mkp_basis import COMBINATION_METRICS
+from mkp_Model import THETA_STATISTICS
+from mkp_env import MKPEnv
+from mkp_lp import lp_relaxation
 from mkp_data import instance_batch, load_benchmark
 from mkp_utils import (construct_solution, file_sha256, load_checkpoint, resolve_device,
                        seed_everything, write_json)
@@ -56,13 +59,12 @@ def solve_instance(instance, model, method, config, device):
     if budget < 1:
         raise ValueError("Sample budget must be positive")
     sampled = method == "learned_dynamic_sampled"
-    mode = "learned_dynamic" if sampled else method
     objectives, best, best_value = [], None, -float("inf")
     synchronize(device)
     began = time.perf_counter()
     for start in range(0, budget, config.sample_batch_size if sampled else 1):
         count = min(config.sample_batch_size, budget - start) if sampled else 1
-        result = construct_solution(instance_batch(instance, count, device), model, mode, sampled)
+        result = construct_solution(instance_batch(instance, count, device), model, sampled)
         current = result["objective"].cpu().tolist()
         objectives.extend(current)
         index = int(np.argmax(current))
@@ -88,11 +90,8 @@ def summarize(rows):
             worst_gap_pct=float(np.max(gaps)) if gaps else None,
             target_hit_rate=float(np.mean([r["target_hit"] for r in group if r["gap_pct"] is not None])) if gaps else None,
             feasible_rate=mean("feasible"), mean_objective=mean("objective"),
-            mean_seconds=mean("solve_seconds"), total_seconds=float(sum(r["solve_seconds"] for r in group)),
-            mean_improvement_over_fixed_pct=mean("improvement_over_fixed_pct"),
-            mean_improvement_over_static_pct=mean("improvement_over_static_pct"),
-            wins_over_fixed=sum(r["improvement_over_fixed_pct"] > 1e-9 for r in group),
-            wins_over_static=sum(r["improvement_over_static_pct"] > 1e-9 for r in group)))
+            mean_utilization=mean("mean_utilization"), mean_seconds=mean("solve_seconds"),
+            total_seconds=float(sum(r["solve_seconds"] for r in group))))
     return summaries
 
 
@@ -152,17 +151,15 @@ def benchmark(config=None):
                 "timing": "Full construction including transfer, synchronized CUDA, no warmup; excludes checkpoint loading",
                 "instance_count": len(instances), "status": "running"}
     write_json(output / "manifest.json", manifest)
-    methods = ["fixed", "learned_static", "learned_dynamic"]
+    methods = ["learned_dynamic"]
     if c.sample_rollouts:
         methods.append("learned_dynamic_sampled")
     fields = ["instance_id", "M", "N", "method", "rollouts", "objective", "reference", "reference_type",
-              "gap_pct", "target_hit", "reference_exceeded", "feasible", "max_capacity_violation",
+              "gap_pct", "lp_bound", "lp_gap_pct", "target_hit", "reference_exceeded", "feasible", "max_capacity_violation",
               "selected_count", "mean_utilization", "min_utilization", "max_utilization", "utilization_by_resource",
               "solve_seconds", "seconds_per_rollout", "sample_mean_objective", "sample_std_objective",
-              "improvement_over_fixed_pct", "improvement_over_static_pct", "profit_exponent_mean",
-              "scarcity_exponent_mean", "bottleneck_weight_mean", "temperature_mean", "price_std_mean",
-              "opportunity_weight_mean", "reserve_weight_mean",
               "size_zero_shot", "checkpoint_sha256", "solution_file"]
+    fields += [name + "_mean" for name in THETA_STATISTICS[:-2]]
     fields += list(COMBINATION_METRICS)
     rows = []
     with (output / "instances.csv").open("w", newline="", encoding="utf-8-sig") as stream, \
@@ -171,7 +168,10 @@ def benchmark(config=None):
         writer.writeheader()
         try:
             for number, instance in enumerate(instances, start=1):
-                instance_rows, objectives = [], {}
+                instance_rows = []
+                # Root LP bound: a solver-independent upper bound, reported for diagnosis only.
+                lp_bound = lp_relaxation(MKPEnv(*instance_batch(instance, 1, device)).state,
+                                         models[instance.m].config).bound.item()
                 for method in methods:
                     # Each instance's sample stream is independent of filtering and prior instances.
                     if method.endswith("sampled"):
@@ -182,13 +182,13 @@ def benchmark(config=None):
                             torch.cuda.manual_seed_all(c.seed + salt)
                     result, elapsed, samples = solve_instance(instance, models[instance.m], method, c, device)
                     objective, utilization, violation, sequence = verify_solution(instance, result, c.feasibility_tolerance)
-                    objectives[method] = objective
                     gap = 100 * (instance.reference - objective) / instance.reference if instance.reference is not None else None
                     stats = result["theta_mean"].tolist()
                     combination = stats[-2:] + result["decoder_mean"].tolist()
                     row = dict(instance_id=instance.instance_id, M=instance.m, N=instance.n, method=method,
                         rollouts=len(samples), objective=objective, reference=instance.reference,
-                        reference_type="dataset_best_known", gap_pct=gap,
+                        reference_type="dataset_best_known", gap_pct=gap, lp_bound=lp_bound,
+                        lp_gap_pct=100 * (lp_bound - objective) / lp_bound,
                         target_hit=int(gap <= c.target_gap_pct) if gap is not None else None,
                         reference_exceeded=int(gap < -1e-9) if gap is not None else None,
                         feasible=1, max_capacity_violation=violation, selected_count=len(sequence),
@@ -196,20 +196,14 @@ def benchmark(config=None):
                         max_utilization=float(utilization.max()), utilization_by_resource=json.dumps(utilization.tolist()),
                         solve_seconds=elapsed, seconds_per_rollout=elapsed / len(samples),
                         sample_mean_objective=float(np.mean(samples)), sample_std_objective=float(np.std(samples)),
-                        profit_exponent_mean=stats[0], scarcity_exponent_mean=stats[1],
-                        bottleneck_weight_mean=stats[2], temperature_mean=stats[3], price_std_mean=stats[4],
-                        opportunity_weight_mean=stats[5], reserve_weight_mean=stats[6],
                         size_zero_shot=int(instance.n not in metadata[str(instance.m)]["train_num_items"]),
                         checkpoint_sha256=metadata[str(instance.m)]["sha256"], solution_file="solutions.jsonl")
+                    row.update((name + "_mean", value) for name, value in zip(THETA_STATISTICS[:-2], stats))
                     row.update(zip(COMBINATION_METRICS, combination))
                     instance_rows.append(row)
                     solution_stream.write(json.dumps({"instance_id": instance.instance_id, "method": method,
                                                       "item_indices_zero_based": sequence, "objective": objective}) + "\n")
                 for row in instance_rows:
-                    for baseline in ("fixed", "static"):
-                        key = "fixed" if baseline == "fixed" else "learned_static"
-                        reference = objectives[key]
-                        row[f"improvement_over_{baseline}_pct"] = 100 * (row["objective"] - reference) / max(reference, 1e-8)
                     writer.writerow(row)
                     rows.append(row)
                 stream.flush()

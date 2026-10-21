@@ -9,6 +9,7 @@ from Benchmark_zeroShot import verify_solution
 from mkp_config import CHECKPOINT_VERSION, CONTROLLER_VERSION, DECODER_VERSION, GeneratorConfig, ModelConfig, config_dict
 from mkp_data import MKPInstance, synthetic_batch
 from mkp_env import MKPEnv, MKPState
+from theta_fixtures import density_theta
 from mkp_Model import CandidatePolicy, MKPModel, StrategyTheta, WeakDecoder
 from mkp_Trainer import generalized_advantage
 from mkp_utils import atomic_checkpoint, load_checkpoint
@@ -58,7 +59,7 @@ class Contracts(unittest.TestCase):
     def test_decoder_agrees_with_literal_formula(self):
         state = toy_state().state
         decoder = WeakDecoder(self.config)
-        theta = decoder.fixed_theta(state)
+        theta = density_theta(state, decoder.config)
         actual = decoder(state, theta)
         rows, cols = state.feasible.nonzero(as_tuple=True)
         w, c, rem = state.weights.float()[rows, cols], state.capacities.float()[rows], state.remaining.float()[rows]

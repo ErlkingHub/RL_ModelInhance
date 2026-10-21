@@ -12,7 +12,8 @@ from mkp_attention import candidate_relations, PairRelationAttention, CriticalCo
 from mkp_config import (CHECKPOINT_VERSION, CONTROLLER_VERSION, DECODER_VERSION,
                         ModelConfig, TrainConfig, config_dict)
 from mkp_env import MKPEnv, MKPState
-from mkp_Model import BipartiteBlock, MKPModel, WeakDecoder
+from theta_fixtures import density_theta
+from mkp_Model import BipartiteBlock, EDGE_DIM, ITEM_DIM, MKPModel, WeakDecoder
 from mkp_ranking import ranking_objective
 from mkp_utils import atomic_checkpoint, load_checkpoint
 from test_opportunity_ranking import critical_state, labeled_batch
@@ -102,7 +103,7 @@ class ControllerAttentionTests(unittest.TestCase):
     def test_ineligible_tokens_cannot_pollute_feasible_attention_messages(self):
         config = replace(self.config, actor_pair_attention=False, actor_postdecision_features=False)
         block = BipartiteBlock(config, strategy=True).eval()
-        items, resources, edges = torch.randn(1, 4, 16), torch.randn(1, 2, 16), torch.randn(1, 4, 2, 3)
+        items, resources, edges = torch.randn(1, 4, 16), torch.randn(1, 2, 16), torch.randn(1, 4, 2, EDGE_DIM)
         valid = torch.tensor([[True, True, False, False]])
         first_i, first_r = block(items, resources, edges, valid)
         changed_i, changed_e = items.clone(), edges.clone()
@@ -173,7 +174,7 @@ class ControllerAttentionTests(unittest.TestCase):
     def test_independent_ablations_and_unchanged_decoder_theta_contract(self):
         state = critical_state()
         expected_decoder = WeakDecoder(self.config)
-        theta = expected_decoder.fixed_theta(state)
+        theta = density_theta(state, expected_decoder.config)
         theta.opportunity_weight.fill_(.7)
         theta.reserve_weight.fill_(.3)
         expected = expected_decoder(state, theta)
@@ -192,7 +193,7 @@ class ControllerAttentionTests(unittest.TestCase):
         with patch("mkp_Model.candidate_relations", side_effect=AssertionError("disabled")):
             MKPModel(disabled).policy(state)
         critic = MKPModel(self.config).critic_encoder
-        self.assertEqual(critic.item_input.in_features, 8)
+        self.assertEqual(critic.item_input.in_features, ITEM_DIM)
         self.assertIsNone(critic.contrast_pool)
         self.assertIsInstance(critic.blocks[0].item_self, torch.nn.MultiheadAttention)
 
@@ -204,7 +205,7 @@ class ControllerAttentionTests(unittest.TestCase):
                   "--actor-relation-chunk-size", "3", "--actor-relation-bandwidth", ".07",
                   "--actor-similarity-bandwidth", ".2"])
         train, config = trainer.call_args.args
-        self.assertEqual(train.checkpoint_dir.name, "combination_v5")
+        self.assertEqual(train.checkpoint_dir.name, "lp_dual_v6")
         self.assertFalse(config.actor_postdecision_features or config.actor_pair_attention
                          or config.actor_contrast_pooling or config.actor_feasible_attention)
         self.assertEqual(config.actor_relation_chunk_size, 3)

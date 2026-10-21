@@ -101,7 +101,8 @@ class PerformanceTests(unittest.TestCase):
         rollout = dict(active=torch.ones(1, 1, dtype=torch.bool), remaining=state.remaining[None],
                        selected=state.selected[None], actions=torch.tensor([[0]]),
                        log_probs=policy.log_prob(torch.tensor([0]))[None], values=value[None],
-                       rewards=torch.tensor([[.4]]), dones=torch.ones(1, 1, dtype=torch.bool))
+                       rewards=torch.tensor([[.4]]), dones=torch.ones(1, 1, dtype=torch.bool),
+                       potentials=torch.tensor([[.45], [0.]]))
         trainer = MKPTrainer.__new__(MKPTrainer)
         trainer.config = TrainConfig(ppo_epochs=2, ranking_coefficient=0)
         trainer.device = torch.device("cpu")

@@ -8,7 +8,8 @@ import torch
 
 from mkp_config import ModelConfig, TrainConfig
 from mkp_env import MKPEnv
-from mkp_Model import MKPModel, WeakDecoder, CandidatePolicy
+from theta_fixtures import density_theta
+from mkp_Model import MKPModel, WeakDecoder, CandidatePolicy, THETA_STATISTICS
 from mkp_ranking import (RankingBatch, paired_terminal_returns, return_targets,
                          collect_ranking_batch, ranking_objective, ranking_kl)
 from mkp_Trainer import MKPTrainer
@@ -44,7 +45,7 @@ class OpportunityTests(unittest.TestCase):
     def test_similar_items_flip_towards_preserved_future_item(self):
         state = critical_state()
         decoder = WeakDecoder(self.config)
-        theta = decoder.fixed_theta(state)
+        theta = density_theta(state, decoder.config)
         self.assertEqual(decoder(state, theta).choose().item(), 0)
         theta.opportunity_weight.fill_(1.)
         self.assertEqual(decoder(state, theta).choose().item(), 1)
@@ -98,13 +99,14 @@ class OpportunityTests(unittest.TestCase):
     def test_ablation_is_exact_old_formula_and_critic_has_no_new_modules(self):
         config = replace(self.config, opportunity_weight_max=0, reserve_weight_max=0,
                          opportunity_tokens=0, actor_edge_values=False,
-                         interaction_weight_max=0, companion_weight_max=0)
+                         interaction_weight_max=0, companion_weight_max=0,
+                         lp_primal_weight_max=0, lp_dual_weight_max=0)
         model = MKPModel(config)
         state = critical_state()
         theta = model.actor(state)[0]
         with patch.object(model.decoder, "opportunity_features", side_effect=AssertionError("disabled")):
             actual = model.decoder(state, theta)
-        torch.testing.assert_close(actual.logits, model.decoder(state, model.decoder.fixed_theta(state)).logits)
+        torch.testing.assert_close(actual.logits, model.decoder(state, density_theta(state, model.decoder.config)).logits)
         self.assertFalse(any("opportunity" in name or "edge_value" in name
                              for name, _ in model.critic_encoder.named_parameters()))
 
@@ -127,6 +129,8 @@ class OpportunityTests(unittest.TestCase):
                        torch.tensor([[[2., 2.], [1., 4.], [3., 1.], [2., 3.], [1., 2.]]]),
                        torch.tensor([[6., 6.]])).state
         model = MKPModel(self.config).eval()
+        with torch.no_grad():
+            model.actor.strategy_head.bias[3] = 10.  # maximal sampling temperature
         generator = torch.Generator().manual_seed(21)
         result = paired_terminal_returns(model, state, torch.tensor([0]), torch.tensor([0]), 24, True, generator)
         self.assertTrue(torch.equal(result[:, :, 0], result[:, :, 1]))
@@ -194,7 +198,7 @@ class OpportunityTests(unittest.TestCase):
         batch = labeled_batch(model, critical_state())
         policy, theta, aux = model.policy(batch.state)
         altered = policy.logits.detach().clone()
-        altered[policy.items == 2] += 5
+        altered[policy.items == 2] = altered.max() + 1  # third item becomes competitive
         shifted = CandidatePolicy(policy.owners, policy.items, altered, 1)
         original_margin = policy.log_prob(batch.left) - policy.log_prob(batch.right)
         torch.testing.assert_close(original_margin, shifted.log_prob(batch.left) - shifted.log_prob(batch.right))
@@ -210,7 +214,8 @@ class OpportunityTests(unittest.TestCase):
         rollout = dict(active=torch.ones(1, 1, dtype=torch.bool), remaining=state.remaining[None],
                        selected=state.selected[None], actions=torch.tensor([[0]]),
                        log_probs=policy.log_prob(torch.tensor([0]))[None], values=value[None],
-                       rewards=torch.tensor([[.4]]), dones=torch.ones(1, 1, dtype=torch.bool))
+                       rewards=torch.tensor([[.4]]), dones=torch.ones(1, 1, dtype=torch.bool),
+                       potentials=torch.tensor([[.45], [0.]]))
         trainer = MKPTrainer.__new__(MKPTrainer)
         trainer.config, trainer.device = self.train, torch.device("cpu")
         optimizer = Mock()
@@ -256,7 +261,7 @@ class OpportunityTests(unittest.TestCase):
     def test_schema_rejects_old_checkpoint_before_loading(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "old.pt"
-            for version in (1, 2, 3, 4):
+            for version in (1, 2, 3, 4, 5):
                 atomic_checkpoint(path, dict(checkpoint_version=version))
                 with self.assertRaisesRegex(ValueError, "fresh training"):
                     load_checkpoint(path, "cpu")
@@ -275,14 +280,14 @@ class OpportunityTests(unittest.TestCase):
     def test_tiny_inference_stats_include_new_theta(self):
         state = critical_state()
         model = MKPModel(self.config)
-        for mode in ("fixed", "learned_static", "learned_dynamic"):
-            result = construct_solution((state.profits, state.weights, state.capacities), model, mode)
-            self.assertEqual(result["theta_mean"].shape, (1, 9))
-            self.assertEqual(result["decoder_mean"].shape, (1, 4))
-            self.assertTrue(torch.isfinite(result["theta_mean"]).all())
-            self.assertTrue((result["remaining"] >= 0).all())
-        with patch.object(WeakDecoder, "opportunity_features", side_effect=AssertionError("fixed baseline")):
-            construct_solution((state.profits, state.weights, state.capacities), model, "fixed")
+        result = construct_solution((state.profits, state.weights, state.capacities), model)
+        self.assertEqual(result["theta_mean"].shape, (1, len(THETA_STATISTICS)))
+        self.assertEqual(result["decoder_mean"].shape, (1, 4))
+        self.assertTrue(torch.isfinite(result["theta_mean"]).all())
+        self.assertTrue((result["remaining"] >= 0).all())
+        lp_weights = result["theta_mean"][0, [THETA_STATISTICS.index("lp_primal_weight"),
+                                              THETA_STATISTICS.index("lp_dual_weight")]]
+        torch.testing.assert_close(lp_weights, torch.full((2,), .5))
 
     def test_global_context_changes_relative_prices(self):
         model = MKPModel(self.config)

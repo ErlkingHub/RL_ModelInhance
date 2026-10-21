@@ -20,7 +20,7 @@ def feature_signature(config):
         "eps", "feature_clip", "actor_postdecision_features", "actor_pair_attention",
         "actor_contrast_pooling", "actor_relation_bandwidth", "opportunity_weight_max",
         "reserve_weight_max", "opportunity_bandwidth", "interaction_weight_max",
-        "companion_weight_max", "companion_scales"))
+        "companion_weight_max", "companion_scales", "lp_temperatures", "lp_newton_steps"))
 
 
 @dataclass
@@ -57,10 +57,13 @@ def prepare_state(state, config):
     from mkp_Model import state_features, WeakDecoder
     from mkp_attention import candidate_relations
     from mkp_basis import interaction_loads, companion_basis
+    from mkp_lp import lp_relaxation
 
     state._prepared = None
     payload = dict(zip(("item", "resource", "edge", "global"), state_features(state, config)))
     payload["feasible"] = state.feasible
+    lp = lp_relaxation(state, config)
+    payload.update(lp_primal=lp.primal, lp_reduced=lp.reduced)
     if config.actor_postdecision_features or config.actor_pair_attention or config.actor_contrast_pooling:
         relations = candidate_relations(state, config)
         for name in ("pairs", "valid", "post", "resource_post"):

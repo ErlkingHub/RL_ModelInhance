@@ -1,8 +1,9 @@
 """Bipartite Transformer -> low-dimensional theta -> parameter-free weak decoder.
 
-Ideas: variable/constraint graph (Gasse et al., 2019); attention for constructive
-optimization (Kool et al., 2019). This is an MKP-specific implementation, not a
-reproduction of either paper. The actor never produces learned per-item logits.
+Ideas: variable/constraint graph with LP solution features (Gasse et al., 2019);
+attention for constructive optimization (Kool et al., 2019). This is an
+MKP-specific implementation, not a reproduction of either paper. The actor never
+produces learned per-item logits.
 """
 from dataclasses import dataclass, fields
 import math
@@ -12,9 +13,18 @@ from mkp_config import ModelConfig
 from mkp_env import MKPState
 from mkp_basis import CombinationControlHead, interaction_loads, companion_basis
 from mkp_performance import cached_features, prepare_state
+from mkp_lp import LP_ITEM_DIM, LP_RESOURCE_DIM, LP_EDGE_DIM, LP_GLOBAL_DIM, lp_relaxation
 from mkp_attention import (POST_DIM, RESOURCE_POST_DIM, candidate_relations,
                            PairRelationAttention, CriticalContrastPool, CandidateRelations,
                            masked_softmax, safe_key_padding_mask)
+
+ITEM_DIM = 8 + LP_ITEM_DIM
+RESOURCE_DIM = 6 + LP_RESOURCE_DIM
+EDGE_DIM = 3 + LP_EDGE_DIM
+GLOBAL_DIM = 6 + LP_GLOBAL_DIM
+THETA_STATISTICS = ("profit_exponent", "scarcity_exponent", "bottleneck_weight", "temperature",
+                    "price_std", "opportunity_weight", "reserve_weight", "lp_primal_weight",
+                    "lp_dual_weight", "interaction_weight_sum", "companion_weight_sum")
 
 
 def state_features(state: MKPState, config: ModelConfig):
@@ -49,12 +59,26 @@ def state_features(state: MKPState, config: ModelConfig):
     global_features = torch.stack((
         (p * selected).sum(-1) / p.sum(-1).clamp_min(eps), selected_fraction,
         feasible_fraction, slack.mean(-1), slack.amin(-1), slack.amax(-1)), dim=-1)
-    return item_features, resource_features, edge_features, global_features
+    # Residual LP: which items the relaxation keeps, the resource shadow prices
+    # (marginal value of capacity), and how much profit can still be reached.
+    lp = lp_relaxation(state, config)
+    dual_cost = lp.dual_share.sum(-1)
+    lp_items = torch.stack((lp.primal, lp.reduced.clamp(-clip, clip),
+                            dual_cost.clamp(1 / clip, clip).log() * feasible,
+                            4 * lp.primal * (1 - lp.primal)), -1)
+    lp_resources = torch.stack((log_feature(lp.dual), lp.slack,
+                                lp.dual / lp.dual.sum(-1, keepdim=True).clamp_min(eps)), -1)
+    lp_global = torch.stack(((lp.bound / state.profits.sum(-1)).float(),
+                             (lp.bound / lp.feasible_mass.clamp_min(eps)).float()), -1)
+    return (torch.cat((item_features, lp_items), -1),
+            torch.cat((resource_features, lp_resources), -1),
+            torch.cat((edge_features, log_feature(lp.dual_share)[..., None]), -1),
+            torch.cat((global_features, lp_global), -1))
 
 
 class EdgeCrossAttention(nn.Module):
     """Multihead cross-attention with resource-consumption edge messages."""
-    def __init__(self, config, edge_values=False, edge_dim=3):
+    def __init__(self, config, edge_values=False, edge_dim=EDGE_DIM):
         super().__init__()
         d = config.embed_dim
         self.heads = config.num_heads
@@ -89,7 +113,7 @@ class BipartiteBlock(nn.Module):
     def __init__(self, config, strategy=False):
         super().__init__()
         d, h = config.embed_dim, config.num_heads
-        edge_dim = 3 + RESOURCE_POST_DIM if strategy and config.actor_postdecision_features else 3
+        edge_dim = EDGE_DIM + RESOURCE_POST_DIM if strategy and config.actor_postdecision_features else EDGE_DIM
         self.item_cross = EdgeCrossAttention(config, strategy and config.actor_edge_values, edge_dim)
         self.resource_cross = EdgeCrossAttention(config, strategy and config.actor_edge_values, edge_dim)
         self.pair_attention = strategy and config.actor_pair_attention
@@ -128,11 +152,11 @@ class BipartiteEncoder(nn.Module):
         self.config = config
         self.strategy = strategy
         d = config.embed_dim
-        item_dim = 8 + POST_DIM if strategy and config.actor_postdecision_features else 8
-        self.item_input, self.resource_input = nn.Linear(item_dim, d), nn.Linear(6, d)
+        item_dim = ITEM_DIM + POST_DIM if strategy and config.actor_postdecision_features else ITEM_DIM
+        self.item_input, self.resource_input = nn.Linear(item_dim, d), nn.Linear(RESOURCE_DIM, d)
         self.blocks = nn.ModuleList([BipartiteBlock(config, strategy) for _ in range(config.num_layers)])
         self.item_norm, self.resource_norm = nn.LayerNorm(d), nn.LayerNorm(d)
-        self.pool = nn.Sequential(nn.Linear(2 * d + 6, d), nn.GELU(), nn.LayerNorm(d))
+        self.pool = nn.Sequential(nn.Linear(2 * d + GLOBAL_DIM, d), nn.GELU(), nn.LayerNorm(d))
         self.queries = None
         self.contrast_pool = CriticalContrastPool(config) if strategy and config.actor_contrast_pooling else None
         if strategy and config.opportunity_tokens:
@@ -184,6 +208,8 @@ class StrategyTheta:
     temperature: torch.Tensor
     opportunity_weight: torch.Tensor  # [B], penalty for lost feasible profit mass
     reserve_weight: torch.Tensor      # [B], smooth loss of future capacity margins
+    lp_primal_weight: torch.Tensor    # [B], affinity for items the residual LP keeps
+    lp_dual_weight: torch.Tensor      # [B], LP reduced cost under shadow prices
     resource_interactions: torch.Tensor  # [B,M,M], symmetric; upper-triangle coefficients counted once
     companion_weights: torch.Tensor      # [B,K], nonnegative fixed pair-basis coefficients
 
@@ -191,9 +217,11 @@ class StrategyTheta:
         return StrategyTheta(*(getattr(self, field.name).detach() for field in fields(self)))
 
     def statistics(self):
+        """[B, len(THETA_STATISTICS)] in that order."""
         return torch.stack((self.profit_exponent, self.scarcity_exponent, self.bottleneck_weight,
                             self.temperature, self.resource_prices.std(-1, unbiased=False),
                             self.opportunity_weight, self.reserve_weight,
+                            self.lp_primal_weight, self.lp_dual_weight,
                             self.resource_interactions.triu().sum((-1, -2)), self.companion_weights.sum(-1)), -1)
 
 
@@ -205,17 +233,18 @@ class HighLevelController(nn.Module):
         # A linear concatenation makes the shared pooled term cancel in softmax.
         self.price_context = nn.Sequential(nn.Linear(3 * config.embed_dim, config.embed_dim), nn.GELU())
         self.price_head = nn.Linear(config.embed_dim, 1, bias=False)
-        self.strategy_head = nn.Linear(config.embed_dim, 6)
+        self.strategy_head = nn.Linear(config.embed_dim, 8)
         self.combination_head = CombinationControlHead(config)
         # Auxiliary state supervision only. Its item outputs never enter decoder scores.
         self.feasibility_head = nn.Linear(config.embed_dim, 1)
         nn.init.zeros_(self.price_head.weight)
         nn.init.zeros_(self.strategy_head.weight)
-        defaults = (1.0, 1.0, 0.1, 0.2, 0.1, 0.1)
+        defaults = (1.0, 1.0, 0.1, 0.2, 0.1, 0.1, config.lp_primal_initial, config.lp_dual_initial)
         bounds = ((config.profit_exponent_min, config.profit_exponent_max),
                   (0, config.scarcity_exponent_max), (0, config.bottleneck_weight_max),
                   (config.temperature_min, config.temperature_max),
-                  (0, config.opportunity_weight_max), (0, config.reserve_weight_max))
+                  (0, config.opportunity_weight_max), (0, config.reserve_weight_max),
+                  (0, config.lp_primal_weight_max), (0, config.lp_dual_weight_max))
         with torch.no_grad():
             for j, (v, (lo, hi)) in enumerate(zip(defaults, bounds)):
                 fraction = min(0.999, max(0.001, (v - lo) / (hi - lo))) if hi > lo else 0.5
@@ -237,6 +266,7 @@ class HighLevelController(nn.Module):
             c.scarcity_exponent_max * controls[:, 1], c.bottleneck_weight_max * controls[:, 2],
             c.temperature_min + (c.temperature_max - c.temperature_min) * controls[:, 3],
             c.opportunity_weight_max * controls[:, 4], c.reserve_weight_max * controls[:, 5],
+            c.lp_primal_weight_max * controls[:, 6], c.lp_dual_weight_max * controls[:, 7],
             interaction, companion)
         return theta, self.feasibility_head(items).squeeze(-1)
 
@@ -295,22 +325,14 @@ class WeakDecoder:
               - kappa * max_j(w_ij / max(c_j, eps))
               - opportunity_weight * blocked_profit_mass_i
               - reserve_weight * smooth_margin_loss_i
+              + lp_primal_weight * log(x_lp_i + floor)
+              + lp_dual_weight * reduced_cost_i
               - sum_{r<=s} interaction_rs * z_ir * z_is
               + sum_k companion_weight_k * companion_basis_ik
     pi(i|s) = softmax(score_i / temperature) over feasible candidates.
     """
     def __init__(self, config: ModelConfig):
         self.config = config
-
-    def fixed_theta(self, state):
-        b, m = state.capacities.shape
-        device = state.profits.device
-        return StrategyTheta(torch.ones(b, m, device=device), torch.ones(b, device=device),
-                             torch.ones(b, device=device), torch.full((b,), 0.1, device=device),
-                             torch.full((b,), 0.2, device=device),
-                             torch.zeros(b, device=device), torch.zeros(b, device=device),
-                             torch.zeros(b, m, m, device=device),
-                             torch.zeros(b, len(self.config.companion_scales), device=device))
 
     @torch.no_grad()
     def opportunity_features(self, state, owners, items):
@@ -373,6 +395,16 @@ class WeakDecoder:
                                 (cached["blocked"][owners, items], cached["reserve"][owners, items]))
             scores = (scores - theta.opportunity_weight[owners] * blocked
                       - theta.reserve_weight[owners] * reserve)
+        if self.config.lp_primal_weight_max or self.config.lp_dual_weight_max:
+            if cached is None:
+                lp = lp_relaxation(state, self.config)
+                primal, reduced = lp.primal[owners, items], lp.reduced[owners, items]
+            else:
+                primal, reduced = cached["lp_primal"][owners, items], cached["lp_reduced"][owners, items]
+            # x_lp is a fixed relaxation value; floor bounds the penalty for LP-rejected items.
+            scores = (scores + theta.lp_primal_weight[owners] * (primal + self.config.lp_primal_floor).log()
+                      + theta.lp_dual_weight[owners] * reduced.clamp(-self.config.feature_clip,
+                                                                     self.config.feature_clip))
         base = scores
         penalty, bonus = torch.zeros_like(scores), torch.zeros_like(scores)
         if self.config.interaction_weight_max:

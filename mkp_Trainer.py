@@ -18,6 +18,7 @@ from mkp_config import (CHECKPOINT_VERSION, CONTROLLER_VERSION, DECODER_VERSION,
 from mkp_data import synthetic_batch
 from mkp_env import MKPEnv, MKPState
 from mkp_Model import MKPModel
+from mkp_lp import lp_potential
 from mkp_basis import COMBINATION_METRICS, decoder_statistics
 from mkp_ranking import collect_ranking_batch, ranking_objective, ranking_kl
 from mkp_performance import (GIB, PERFORMANCE_FIELDS, configure_training_runtime,
@@ -25,6 +26,16 @@ from mkp_performance import (GIB, PERFORMANCE_FIELDS, configure_training_runtime
 from mkp_diagnostics import convergence_report, plot_training, prepare_plotting
 from mkp_utils import (atomic_checkpoint, construct_solution, load_checkpoint, resolve_device,
                        seed_everything, write_json)
+
+
+def shaped_rewards(rewards, potentials, active):
+    """r_t + Phi(s_{t+1}) - Phi(s_t); Phi is the residual LP bound, 0 when terminal.
+
+    The sum telescopes to objective - Phi(s_0), an instance constant, so (gamma=1)
+    every policy's return shifts equally. Each step is charged the upper-bound loss
+    its choice causes: wasted capacity is penalized immediately, not at episode end.
+    """
+    return (rewards + potentials[1:] - potentials[:-1]) * active
 
 
 def generalized_advantage(rewards, values, dones, active, gamma, gae_lambda):
@@ -45,7 +56,7 @@ def generalized_advantage(rewards, values, dones, active, gamma, gae_lambda):
 def collect_rollout(model, data):
     env = MKPEnv(*data)
     records = {key: [] for key in ("remaining", "selected", "actions", "log_probs",
-                                  "values", "rewards", "dones", "active")}
+                                  "values", "rewards", "dones", "active", "potentials")}
     model.eval()  # no dropout anywhere: collection and PPO recomputation agree
     combination_sum = data[0].new_zeros(len(COMBINATION_METRICS), dtype=torch.float32)
     transition_count = data[0].new_zeros((), dtype=torch.float32)
@@ -54,6 +65,8 @@ def collect_rollout(model, data):
         if not active.any():
             break
         policy, value, theta, _ = model(env.state)
+        # The LP solve is memoized on this state; the potential reuses it.
+        records["potentials"].append(lp_potential(env.state, model.feature_config))
         combination = torch.cat((theta.statistics()[:, -2:], decoder_statistics(policy)), -1)
         combination_sum += (combination * active[:, None]).sum(0)
         transition_count += active.sum()
@@ -71,7 +84,10 @@ def collect_rollout(model, data):
         raise ValueError("Synthetic batch has no feasible item; adjust the generator")
     if env.state.active.any():
         raise RuntimeError("Rollout exceeded N steps")
+    # Terminal rows have no feasible item, so their LP bound is exactly zero.
+    records["potentials"].append(torch.zeros_like(records["potentials"][0]))
     result = {k: torch.stack(v) for k, v in records.items()}
+    result["lp_bound_initial"] = records["potentials"][0]
     result["objective"] = env.objective
     result["utilization"] = (1 - env.state.remaining / env.state.capacities).mean()
     result["combination_metrics"] = dict(zip(COMBINATION_METRICS,
@@ -99,8 +115,8 @@ class MKPTrainer:
         self.fields = ["M", "N", "update", "transitions", "objective_mean", "normalized_return",
                        "utilization", "policy_loss", "value_loss", "constraint_aux_loss",
                        "entropy", "approx_kl", "clip_fraction", "grad_norm", "explained_variance",
-                       "minibatches", "kl_stopped", "validation_return", "validation_improvement_pct",
-                       "best_validation_return", "elapsed_seconds"]
+                       "minibatches", "kl_stopped", "rollout_lp_gap_pct", "shaped_return",
+                       "validation_return", "validation_lp_gap_pct", "best_validation_return", "elapsed_seconds"]
         self.fields += ["ranking_proposed", "ranking_pairs", "ranking_abs_return_gap",
                         "ranking_standard_error", "ranking_label_seconds", "ranking_loss",
                         "ranking_accuracy", "ranking_kl", "ranking_minibatches"]
@@ -119,7 +135,9 @@ class MKPTrainer:
         # behavior policy. Branches never enter the PPO buffer or critic targets.
         ranking, ranking_stats = collect_ranking_batch(model, data, rollout, c,
             seed=c.seed + 1000003 * update + data[2].shape[-1])
-        advantages, returns = generalized_advantage(rollout["rewards"], rollout["values"],
+        rewards = (shaped_rewards(rollout["rewards"], rollout["potentials"], rollout["active"].float())
+                   if c.lp_reward_shaping else rollout["rewards"])
+        advantages, returns = generalized_advantage(rewards, rollout["values"],
             rollout["dones"], rollout["active"], c.gamma, c.gae_lambda)
         times, batches = rollout["active"].nonzero(as_tuple=True)
         ppo_began = time.perf_counter()
@@ -195,7 +213,8 @@ class MKPTrainer:
         variance = targets.var(unbiased=False)
         explained = (1 - (targets - old_values).var(unbiased=False) / variance).item() if variance > 1e-12 else float("nan")
         result = dict(zip(metric_names, (sums / max(1, observations)).tolist()))
-        result.update(minibatches=minibatches, kl_stopped=int(stopped), explained_variance=explained)
+        result.update(minibatches=minibatches, kl_stopped=int(stopped), explained_variance=explained,
+                      shaped_return=rewards.sum(0).mean().item())
         if ranking is not None:
             final_kl = ranking_kl(model, ranking).item()
             if not math.isfinite(final_kl):
@@ -256,8 +275,9 @@ class MKPTrainer:
         vrng = np.random.default_rng(c.validation_seed + m)
         validation = [synthetic_batch(c.validation_instances_per_shape, n, m, self.generator_config,
                                      vrng, self.device) for n in c.train_num_items]
-        fixed_objectives = [construct_solution(data, mode="fixed", model_config=self.model_config)["objective"]
-                            for data in validation]
+        # Initial-state LP bounds give a policy-independent reference for validation.
+        validation_bounds = [lp_potential(MKPEnv(*data).state, self.model_config) * data[0].sum(-1)
+                             for data in validation]
         if saved:
             rng.bit_generator.state = saved["numpy_generator_state"]
             torch.set_rng_state(saved["torch_rng_state"])
@@ -287,29 +307,32 @@ class MKPTrainer:
                                                  if self.device.type == "cuda" else 0.),
                          gpu_peak_reserved_gib=(torch.cuda.max_memory_reserved(self.device) / GIB
                                                 if self.device.type == "cuda" else 0.))
-            validation_return, improvement = None, None
+            validation_return, lp_gap = None, None
             improved = False
             if update == start or update % c.validation_every == 0 or update == c.updates:
                 objectives = [construct_solution(d, model)["objective"] for d in validation]
                 validation_return = torch.cat([obj / d[0].sum(-1) for obj, d in zip(objectives, validation)]).mean().item()
-                improvement = torch.cat([100 * (obj - ref) / ref.clamp_min(1)
-                                         for obj, ref in zip(objectives, fixed_objectives)]).mean().item()
+                lp_gap = torch.cat([100 * (ref - obj) / ref.clamp_min(1e-12)
+                                    for obj, ref in zip(objectives, validation_bounds)]).mean().item()
                 improved = validation_return > best
                 best = max(best, validation_return)
             row = dict(M=m, N=n, update=update, transitions=int(rollout["active"].sum()),
                        objective_mean=rollout["objective"].mean().item(),
                        normalized_return=(rollout["objective"] / data[0].sum(-1)).mean().item(),
                        utilization=rollout["utilization"].item(), **stats, **rollout.get("combination_metrics", {}),
-                       validation_return=validation_return, validation_improvement_pct=improvement,
+                       rollout_lp_gap_pct=(100 * (1 - rollout["objective"] / data[0].sum(-1)
+                                               / rollout["lp_bound_initial"].clamp_min(1e-12))).mean().item(),
+                       validation_return=validation_return, validation_lp_gap_pct=lp_gap,
                        best_validation_return=best, elapsed_seconds=time.perf_counter() - began)
             history.append(row)
             with (self.run_dir / "metrics.csv").open("a", newline="", encoding="utf-8") as f:
                 csv.DictWriter(f, fieldnames=self.fields).writerow(row)
-            self.logger.info("M=%d update=%d/%d N=%d reward=%.5f policy=%.5f value=%.5f "
-                             "entropy=%.5f KL=%.5f clip=%.5f grad=%.5f explained_variance=%.5f val=%s",
-                             m, update, c.updates, n, row["normalized_return"], stats["policy_loss"],
-                             stats["value_loss"], stats["entropy"], stats["approx_kl"], stats["clip_fraction"],
-                             stats["grad_norm"], stats["explained_variance"], validation_return)
+            self.logger.info("M=%d update=%d/%d N=%d reward=%.5f lp_gap=%.4f%% policy=%.5f value=%.5f "
+                             "entropy=%.5f KL=%.5f clip=%.5f grad=%.5f explained_variance=%.5f val=%s val_lp_gap=%s",
+                             m, update, c.updates, n, row["normalized_return"], row["rollout_lp_gap_pct"],
+                             stats["policy_loss"], stats["value_loss"], stats["entropy"], stats["approx_kl"],
+                             stats["clip_fraction"], stats["grad_norm"], stats["explained_variance"],
+                             validation_return, lp_gap)
             self.logger.info("M=%d update=%d COMBINATION | interaction_mass=%.5f companion_mass=%.5f "
                              "penalty=%.5f bonus=%.5f abs_delta=%.5f margin_ratio=%.5f",
                              m, update, *(row.get(key, 0.) for key in COMBINATION_METRICS))
@@ -385,6 +408,10 @@ def main(argv=None):
     parser.add_argument("--ranking-states", type=int, default=defaults.ranking_states)
     parser.add_argument("--ranking-pool-size", type=int, default=defaults.ranking_pool_size)
     parser.add_argument("--ranking-repeats", type=int, default=defaults.ranking_repeats)
+    parser.add_argument("--lp-reward-shaping", action=argparse.BooleanOptionalAction,
+                        default=defaults.lp_reward_shaping)
+    parser.add_argument("--lp-primal-weight-max", type=float, default=model_defaults.lp_primal_weight_max)
+    parser.add_argument("--lp-dual-weight-max", type=float, default=model_defaults.lp_dual_weight_max)
     parser.add_argument("--opportunity-weight-max", type=float, default=model_defaults.opportunity_weight_max)
     parser.add_argument("--reserve-weight-max", type=float, default=model_defaults.reserve_weight_max)
     parser.add_argument("--opportunity-tokens", type=int, default=model_defaults.opportunity_tokens)
@@ -410,8 +437,11 @@ def main(argv=None):
                          ranking_states=args.ranking_states, ranking_pool_size=args.ranking_pool_size,
                          ranking_repeats=args.ranking_repeats, performance_profile=args.performance_profile,
                          feature_cache_gib=args.feature_cache_gib, cache_headroom_gib=args.cache_headroom_gib,
-                         feature_cache_batch_size=args.feature_cache_batch_size)
-    model = ModelConfig(opportunity_weight_max=args.opportunity_weight_max,
+                         feature_cache_batch_size=args.feature_cache_batch_size,
+                         lp_reward_shaping=args.lp_reward_shaping)
+    model = ModelConfig(lp_primal_weight_max=args.lp_primal_weight_max,
+                        lp_dual_weight_max=args.lp_dual_weight_max,
+                        opportunity_weight_max=args.opportunity_weight_max,
                         reserve_weight_max=args.reserve_weight_max, opportunity_tokens=args.opportunity_tokens,
                         actor_edge_values=args.actor_edge_values,
                         actor_postdecision_features=args.actor_postdecision_features,

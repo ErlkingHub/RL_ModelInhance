@@ -12,6 +12,7 @@ class MKPState:
     selected: torch.Tensor         # [B, N], bool
 
     _prepared: object = field(default=None, repr=False, compare=False)
+    _lp: object = field(default=None, repr=False, compare=False)
 
     @property
     def feasible(self):

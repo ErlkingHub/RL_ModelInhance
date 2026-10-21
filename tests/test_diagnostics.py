@@ -116,7 +116,8 @@ class ConvergenceTests(unittest.TestCase):
 
             def fake_rollout(model, data):
                 return {"active": torch.ones(1, 2, dtype=torch.bool),
-                        "objective": data[0].sum(-1) * .5, "utilization": torch.tensor(.9)}
+                        "objective": data[0].sum(-1) * .5, "utilization": torch.tensor(.9),
+                        "lp_bound_initial": torch.full((2,), .6)}
 
             stats = {key: .1 for key in ("policy_loss", "value_loss", "constraint_aux_loss", "entropy",
                                         "approx_kl", "clip_fraction", "grad_norm", "explained_variance")}
