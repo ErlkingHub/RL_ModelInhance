@@ -20,7 +20,7 @@ def feature_signature(config):
         "eps", "feature_clip", "actor_postdecision_features", "actor_pair_attention",
         "actor_contrast_pooling", "actor_relation_bandwidth", "opportunity_weight_max",
         "reserve_weight_max", "opportunity_bandwidth", "interaction_weight_max",
-        "companion_weight_max", "companion_scales"))
+        "companion_weight_max", "companion_scales", "actor_resource_refinement"))
 
 
 @dataclass
@@ -61,6 +61,11 @@ def prepare_state(state, config):
     state._prepared = None
     payload = dict(zip(("item", "resource", "edge", "global"), state_features(state, config)))
     payload["feasible"] = state.feasible
+    if config.actor_resource_refinement:
+        from mkp_resource import resource_geometry
+        geometry = resource_geometry(state, config)
+        payload.update(resource_geometry=geometry.resources, resource_relations=geometry.relations,
+                       resource_pressure=geometry.pressure)
     if config.actor_postdecision_features or config.actor_pair_attention or config.actor_contrast_pooling:
         relations = candidate_relations(state, config)
         for name in ("pairs", "valid", "post", "resource_post"):

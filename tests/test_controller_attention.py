@@ -204,7 +204,7 @@ class ControllerAttentionTests(unittest.TestCase):
                   "--actor-relation-chunk-size", "3", "--actor-relation-bandwidth", ".07",
                   "--actor-similarity-bandwidth", ".2"])
         train, config = trainer.call_args.args
-        self.assertEqual(train.checkpoint_dir.name, "combination_v5")
+        self.assertEqual(train.checkpoint_dir.name, "resource_strategy_v2")
         self.assertFalse(config.actor_postdecision_features or config.actor_pair_attention
                          or config.actor_contrast_pooling or config.actor_feasible_attention)
         self.assertEqual(config.actor_relation_chunk_size, 3)

@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parent
 CHECKPOINT_VERSION = 5
 CONTROLLER_VERSION = "combination_theta_v5"
 DECODER_VERSION = "second_order_density_v5"
+ACTOR_ARCHITECTURE_VERSION = "resource_strategy_v2"
 
 @dataclass
 class TrainConfig:
@@ -33,9 +34,14 @@ class TrainConfig:
     ranking_candidates: int = 8
     ranking_repeats: int = 4
     ranking_minibatch_size: int = 8
-    ranking_min_gap: float = 0.001
+    # Dense greedy labels match deterministic evaluation; stochastic returns only
+    # modulate confidence. legacy_mixed reproduces the previous paired labeling.
+    ranking_target_mode: str = "dense_greedy"
+    ranking_confidence_floor: float = 0.25
+    ranking_branch_chunk_size: int = 128
+    ranking_min_gap: float = 1e-6
     ranking_se_multiplier: float = 1.0
-    ranking_return_scale: float = 0.02
+    ranking_return_scale: float = 0.002
     ranking_score_scale: float = 0.2
     ranking_greedy_weight: float = 0.5
     validation_every: int = 25
@@ -58,7 +64,7 @@ class TrainConfig:
     cache_headroom_gib: float = 6.0
     feature_cache_batch_size: int = 64
     runs_dir: Path = field(default_factory=lambda: ROOT / "runs")
-    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / "combination_v5")
+    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / ACTOR_ARCHITECTURE_VERSION)
 
     def __post_init__(self):
         counts = (self.updates, self.batch_size, self.minibatch_size, self.ppo_epochs,
@@ -89,8 +95,13 @@ class TrainConfig:
             raise ValueError("convergence_tolerance_pct must lie in (0, 100)")
         if self.convergence_min_evaluations < 2:
             raise ValueError("convergence_min_evaluations must be at least 2")
-        if min(self.ranking_states, self.ranking_pool_size, self.ranking_minibatch_size) < 1:
+        if min(self.ranking_states, self.ranking_pool_size, self.ranking_minibatch_size,
+               self.ranking_branch_chunk_size) < 1:
             raise ValueError("Ranking batch sizes must be positive")
+        if self.ranking_target_mode not in ("dense_greedy", "legacy_mixed"):
+            raise ValueError("ranking_target_mode must be dense_greedy or legacy_mixed")
+        if not math.isfinite(self.ranking_confidence_floor) or not 0 < self.ranking_confidence_floor <= 1:
+            raise ValueError("ranking_confidence_floor must lie in (0, 1]")
         if self.ranking_pool_size < self.ranking_states or self.ranking_candidates < 2 or self.ranking_repeats < 2:
             raise ValueError("Ranking needs pool >= states, candidates >= 2 and repeats >= 2")
         if not (self.ranking_coefficient >= 0 and self.ranking_min_gap >= 0
@@ -127,6 +138,13 @@ class ModelConfig:
     actor_relation_chunk_size: int = 32
     actor_relation_bandwidth: float = 0.05
     actor_similarity_bandwidth: float = 0.1
+    # Preserve the original candidate graph; refine resources and theta readout.
+    actor_resource_refinement: bool = True
+    actor_resource_gate_init: float = 0.1
+    actor_resource_gate_max: float = 0.5
+    actor_type_balanced_pooling: bool = True
+    actor_strategy_tokens: bool = True
+    actor_readout_initial_scale: float = 0.1
     opportunity_tokens: int = 4
     opportunity_weight_max: float = 4.0
     reserve_weight_max: float = 4.0
@@ -139,6 +157,15 @@ class ModelConfig:
     companion_scales: tuple[float, ...] = (0.5, 2.0, 8.0)
     combination_chunk_size: int = 64
     eps: float = 1e-8
+
+    @classmethod
+    def from_checkpoint(cls, values):
+        # Historical v5 files have precisely the original parameter tree.
+        # Missing enhancement flags must never instantiate random new modules.
+        values = dict(values)
+        for name in ("actor_resource_refinement", "actor_type_balanced_pooling", "actor_strategy_tokens"):
+            values.setdefault(name, False)
+        return cls(**values)
 
     def __post_init__(self):
         if self.embed_dim < 1 or self.num_heads < 1 or self.embed_dim % self.num_heads:
@@ -159,6 +186,11 @@ class ModelConfig:
             raise ValueError("Invalid opportunity attention/chunk sizes")
         if self.actor_relation_chunk_size < 1:
             raise ValueError("actor_relation_chunk_size must be positive")
+        if not (math.isfinite(self.actor_resource_gate_init) and math.isfinite(self.actor_resource_gate_max)
+                and 0 < self.actor_resource_gate_init < self.actor_resource_gate_max <= 1):
+            raise ValueError("Resource residual gates require 0 < init < max <= 1")
+        if not math.isfinite(self.actor_readout_initial_scale) or not 0 < self.actor_readout_initial_scale < 1:
+            raise ValueError("actor_readout_initial_scale must lie in (0, 1)")
         if not all(math.isfinite(x) and x > 0 for x in
                    (self.actor_relation_bandwidth, self.actor_similarity_bandwidth)):
             raise ValueError("Actor relation bandwidths must be finite and positive")
@@ -205,7 +237,7 @@ class BenchmarkConfig:
     dataset: Path = field(default_factory=lambda: ROOT / "MKP_dataset" / "Benchmarks_Chu.mat")
     num_resources: tuple[int, ...] = (5, 10)
     num_items: tuple[int, ...] = (100, 250, 500)
-    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / "combination_v5")
+    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / ACTOR_ARCHITECTURE_VERSION)
     results_dir: Path = field(default_factory=lambda: ROOT / "results")
     checkpoint_tag: str = "best"
     device: str = "auto"

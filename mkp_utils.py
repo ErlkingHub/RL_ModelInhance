@@ -69,7 +69,7 @@ def load_checkpoint(path, device, expected_m=None):
         raise ValueError(f"Checkpoint M={payload['num_resources']} differs from requested M={expected_m}")
     if payload.get("training_data_source") != "synthetic_only":
         raise ValueError("Strict zero-shot pipeline requires a synthetic-only training checkpoint")
-    model = MKPModel(ModelConfig(**payload["model_config"]))
+    model = MKPModel(ModelConfig.from_checkpoint(payload["model_config"]))
     model.load_state_dict(payload["model_state"], strict=True)
     return model.to(device), payload
 

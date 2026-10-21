@@ -4,7 +4,9 @@
 
 目标是在 `MKP_dataset/Benchmarks_Chu.mat` 上研究接近或低于 **0.1% gap** 的解。该目标需要实验验证，代码交付本身不代表达到该精度。默认训练与测试均由使用者运行。
 
-当前为 **combination θ v5**：在上一版的关系感知 Actor 上，扩展 `StrategyTheta` 和透明评分基函数，使网络识别到的资源联动与两物品搭配能够直接影响评分。checkpoint schema 为 5，控制器标识 `combination_theta_v5`，解码器标识 `second_order_density_v5`；v1–v4 checkpoint 明确拒绝加载，需要重新训练，默认保存至 `checkpoints/combination_v5/`。
+当前默认结构为 **resource_strategy_v2**：保留 combination θ v5、原物品组合通道和固定弱解码器，增加资源关系残差、按类型分别聚合的九角色策略读出，以及对齐 greedy 的精细终局排序监督。详细设计、训练/评估命令及独立消融见 [RESOURCE_STRATEGY_V2.md](RESOURCE_STRATEGY_V2.md)。新结构需要重新训练，默认目录为 `checkpoints/resource_strategy_v2/`；旧 v5 checkpoint 仍可严格加载原网络用于评估。
+
+θ/解码器合约仍为 checkpoint schema 5、控制器 `combination_theta_v5`、解码器 `second_order_density_v5`；完整网络开关保存在 `model_config`。下面 v3/v4/v5 小节说明所保留机制的来源，新的默认结构与排序标签以本节链接的说明为准。
 
 ## 24GB GPU 训练速度优化
 
@@ -26,11 +28,11 @@ python train_ConstrainedMKP.py --performance-profile memory24
 python train_ConstrainedMKP.py --performance-profile reference
 # 只关闭跨 epoch 的整批状态缓存，保留大分块和单次前向内的特征复用
 python train_ConstrainedMKP.py --performance-profile memory24 --feature-cache-gib 0
-# 从已有 v5 checkpoint 续训；updates 是累计更新次数，原模型参数需保持一致
-python train_ConstrainedMKP.py --resources 5 --resume checkpoints/combination_v5/mkp_M5_last.pt --updates 4000
+# 从本次新结构 checkpoint 续训；updates 是累计更新次数，原模型参数需保持一致
+python train_ConstrainedMKP.py --resources 5 --resume checkpoints/resource_strategy_v2/mkp_M5_last.pt --updates 4000
 ```
 
-**本轮速度优化不更改 checkpoint schema 或 model_config，不需要重训现有 v5 模型。** 执行设置单独保存到 `runtime_M5.json` / `runtime_M10.json` 和 checkpoint 的 `training_runtime`；`--resume` 可更改缓存预算或执行 profile。已启动的 Python 进程需要重启并续训才会使用新代码。扩大矩阵分块可能造成浮点舍入差异，不能承诺长程采样/训练逐位相同。独立 Benchmark 默认仍按 checkpoint 原模型配置推理。
+**执行 profile 本身不改变模型结构；本次新增的资源增强和策略读出则需要重新训练。** 执行设置单独保存到 `runtime_M5.json` / `runtime_M10.json` 和 checkpoint 的 `training_runtime`；`--resume` 可更改缓存预算或执行 profile。扩大矩阵分块可能造成浮点舍入差异，不能承诺长程采样/训练逐位相同。独立 Benchmark 按 checkpoint 原模型配置推理。
 
 2026-09-21 本机短时测量，PyTorch 2.11.0+cu128，B=128、N=100、M=10，默认网络；预热 2 次、计时 6 次，512 个合成状态，仅执行前向/反向：
 
@@ -77,9 +79,9 @@ python profile_training_speed.py --output outputs/performance_probe.json
 这些开关改变评分表达，与下方 Actor 感知开关相互独立。其他参数为 `--companion-scales 0.5 2 8`、`--combination-initial-weight 0.02`、`--combination-chunk-size 64`。更改尺度会改变基函数及 checkpoint 配置，续训必须使用原设置。
 
 ```powershell
-# 自行运行：完整 v5
-python train_ConstrainedMKP.py --checkpoint-dir checkpoints/combination_v5
-python Benchmark_zeroShot.py --checkpoint-dir checkpoints/combination_v5
+# 自行运行：当前默认结构，保留完整 v5 评分
+python train_ConstrainedMKP.py --checkpoint-dir checkpoints/resource_strategy_v2
+python Benchmark_zeroShot.py --checkpoint-dir checkpoints/resource_strategy_v2
 # 自行运行：同一 Actor、上一版评分的对照，需要单独重新训练
 python train_ConstrainedMKP.py --interaction-weight-max 0 --companion-weight-max 0 --checkpoint-dir checkpoints/ablation_v4_score
 python Benchmark_zeroShot.py --checkpoint-dir checkpoints/ablation_v4_score
@@ -137,7 +139,7 @@ python Benchmark_zeroShot.py --checkpoint-dir checkpoints/ablation_v4_score
 # 自行运行：只训练一个资源维度
 & 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' train_ConstrainedMKP.py --resources 5 --updates 2000
 # 自行运行：从 last checkpoint 继续，updates 是累计更新次数目标
-& 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' train_ConstrainedMKP.py --resources 5 --resume checkpoints/combination_v5/mkp_M5_last.pt --updates 4000
+& 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' train_ConstrainedMKP.py --resources 5 --resume checkpoints/resource_strategy_v2/mkp_M5_last.pt --updates 4000
 # 可选：另报 128 条随机轨迹中的最佳解，不替代单轨迹 greedy 结果
 & 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' Benchmark_zeroShot.py --sample-rollouts 128
 ```
@@ -153,6 +155,8 @@ python Benchmark_zeroShot.py --checkpoint-dir checkpoints/ablation_v4_score
 | `mkp_env.py`              | float64 容量与收益记账，逐步选择，终止与可行候选集合      |
 | `mkp_Model.py`            | 二分图多头 Transformer、高层策略、固定解码器、独立 Critic |
 | `mkp_attention.py`        | Actor 选后兼容特征、物品关系注意力、相似候选差异池化       |
+| `mkp_resource.py`         | 可行需求几何、资源读取组合物品表示、资源关系有界残差       |
+| `mkp_controller.py`       | 物品/资源分别聚合、九角色策略读出                         |
 | `mkp_basis.py`            | 组合 θ 输出头、固定二阶/搭配基函数、评分贡献统计           |
 | `mkp_performance.py`      | 训练执行 profile、无梯度固定特征缓存、显存预算回退        |
 | `profile_training_speed.py` | 合成状态前向/反向短时计时，不执行优化器更新              |
@@ -160,14 +164,15 @@ python Benchmark_zeroShot.py --checkpoint-dir checkpoints/ablation_v4_score
 | `mkp_ranking.py`          | 关键候选筛选、固定策略成对续行、收益标签与排序损失       |
 | `train_ConstrainedMKP.py` | 简洁训练入口                                              |
 | `Benchmark_zeroShot.py`   | 冻结推理、独立解校验、CSV 与物品序列                      |
+| `compare_mkp_results.py`  | 保存结果的严格配对对照及平均 gap <0.1% 核验              |
 | `mkp_utils.py`            | 复现设置、checkpoint 合约、共享构造过程                   |
 | `tests/test_contracts.py` | 小张量接口与梯度校验，不执行训练或 benchmark              |
 
 - `runs/<时间戳>/train.log`：每次更新的日志。
 - `runs/<时间戳>/metrics.csv`：收益、归一化 return、利用率、PPO 各项损失、归一化 entropy、KL、梯度范数、Critic explained variance、合成验证表现。
 - `runs/<时间戳>/config.json`：配置与运行环境。
-- `checkpoints/combination_v5/mkp_M5_best.pt`、同目录 `mkp_M10_best.pt`：按固定合成验证集的 greedy 归一化收益选择。
-- `checkpoints/combination_v5/mkp_M5_last.pt`、同目录 `mkp_M10_last.pt`：最近一次保存的模型，包含优化器和 RNG 状态；默认每 100 次更新、产生新 best 及训练结束时保存。
+- `checkpoints/resource_strategy_v2/mkp_M5_best.pt`、同目录 `mkp_M10_best.pt`：按固定合成验证集的 greedy 归一化收益选择。
+- `checkpoints/resource_strategy_v2/mkp_M5_last.pt`、同目录 `mkp_M10_last.pt`：最近一次保存的模型，包含优化器和 RNG 状态；默认每 100 次更新、产生新 best 及训练结束时保存。
 - `results/<时间戳>/instances.csv`：逐实例、逐方法报告。
 - `results/<时间戳>/summary.csv`：每种方法按 M/N 分组及总体报告。
 - `results/<时间戳>/solutions.jsonl`：零基索引物品选择顺序，可独立复核。
@@ -341,14 +346,14 @@ h = opportunity_bandwidth = 0.05
 
 ### 同状态的长程排序训练
 
-每次 PPO 更新之前，从本轮合成 rollout 抽取最多 64 个状态。以实际 greedy 候选为锚，在最高分的 8 个可行候选中，按利润差、逐资源占用差和原始 score 差选择相近对手。最多保留 16 个状态：约 3/4 优先取难区分的状态，其余随机选取，限制只盯着最小分差带来的偏置。
+当前默认 `dense_greedy`：每次 PPO 更新前，从最多 64 个合成 rollout 状态中选最多 16 个，一半优先后段，一半优先分数接近。每状态覆盖最多 8 个不同候选，包括 greedy、高分、高收益、资源密度与随机对手。
 
-对每个状态复制两个分支，分别先选 i、j；后续都使用**本次更新前、参数固定的策略**构造到终点。每对执行 1 组 greedy 续行和 4 组随机续行；随机分支在相同步骤对相同原始物品共享 Gumbel 噪声。标签为归一化终局收益差 Δ，默认各占 50% greedy 和随机均值。过滤 `|Δ| <= max(0.001, SE)` 的小差异/噪声样本，也过滤 greedy 与随机均值明确冲突的方向。该标签是当前策略下的续行估计，不是最优 Q 值或 oracle。
+候选从同一状态分别强制选择后，由**本次更新前、参数固定的策略**完成 1 次 greedy 和 4 次随机续行，后者共享物品噪声。用 greedy 终局收益最高的候选对比其余候选；收益差减去公共已选前缀，再以最优候选的剩余收益归一化。保留 float64 标签，默认过滤阈值仅为 1e-6；随机意见冲突只降低置信度，不反转 greedy 方向。该标签是有限候选的策略续行证据，不是最优 Q 值或 oracle。旧的 50/50 混合与硬过滤可通过 `--ranking-target-mode legacy_mixed` 及原阈值复现，命令见新版说明。
 
 ```text
 target = sigmoid(delta / ranking_return_scale)
 margin = (score_i - score_j) / ranking_score_scale
-ranking_loss = BCEWithLogits(margin, target)
+ranking_loss = mean(state_weight * confidence * BCEWithLogits(margin, target))
 total_loss = 原 PPO/Value/可行性/Entropy 损失 + 0.1 * ranking_loss
 ```
 

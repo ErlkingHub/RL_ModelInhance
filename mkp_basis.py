@@ -32,7 +32,7 @@ class CombinationControlHead(nn.Module):
             fraction = min(config.combination_initial_weight / maximum, .5) if maximum else .5
             nn.init.constant_(layer.bias, math.log(fraction / (1 - fraction)))
 
-    def forward(self, resources, pooled):
+    def forward(self, resources, pooled, companion_context=None):
         b, m, d = resources.shape
         left, right = resources[:, :, None], resources[:, None, :]
         context = torch.cat((left + right, (left - right).abs(), left * right,
@@ -43,8 +43,9 @@ class CombinationControlHead(nn.Module):
         weights = weights * (self.config.interaction_weight_max * self.interaction_gate(pooled).sigmoid())[:, :, None]
         # Store each unordered coefficient symmetrically, but count it once in scores.
         interaction = weights + weights.transpose(1, 2) - torch.diag_embed(weights.diagonal(dim1=1, dim2=2))
-        companion = (self.companion_mix(pooled).softmax(-1)
-                     * self.config.companion_weight_max * self.companion_gate(pooled).sigmoid())
+        companion_context = pooled if companion_context is None else companion_context
+        companion = (self.companion_mix(companion_context).softmax(-1)
+                     * self.config.companion_weight_max * self.companion_gate(companion_context).sigmoid())
         return interaction, companion
 
 

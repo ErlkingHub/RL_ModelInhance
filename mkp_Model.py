@@ -12,6 +12,8 @@ from mkp_config import ModelConfig
 from mkp_env import MKPState
 from mkp_basis import CombinationControlHead, interaction_loads, companion_basis
 from mkp_performance import cached_features, prepare_state
+from mkp_controller import TypeBalancedAttention, StrategyReadout
+from mkp_resource import ResourceRefinement, ResourceGeometry, resource_geometry
 from mkp_attention import (POST_DIM, RESOURCE_POST_DIM, candidate_relations,
                            PairRelationAttention, CriticalContrastPool, CandidateRelations,
                            masked_softmax, safe_key_padding_mask)
@@ -134,10 +136,15 @@ class BipartiteEncoder(nn.Module):
         self.item_norm, self.resource_norm = nn.LayerNorm(d), nn.LayerNorm(d)
         self.pool = nn.Sequential(nn.Linear(2 * d + 6, d), nn.GELU(), nn.LayerNorm(d))
         self.queries = None
+        self.balanced_attention = (TypeBalancedAttention(config)
+                                  if strategy and config.actor_type_balanced_pooling and config.opportunity_tokens else None)
+        self.resource_refinement = (ResourceRefinement(config)
+                                    if strategy and config.actor_resource_refinement else None)
         self.contrast_pool = CriticalContrastPool(config) if strategy and config.actor_contrast_pooling else None
         if strategy and config.opportunity_tokens:
             self.queries = nn.Parameter(torch.randn(config.opportunity_tokens, d) / math.sqrt(d))
-            self.opportunity_attention = nn.MultiheadAttention(d, config.num_heads, batch_first=True)
+            if self.balanced_attention is None:
+                self.opportunity_attention = nn.MultiheadAttention(d, config.num_heads, batch_first=True)
             self.opportunity_pool = nn.Sequential(
                 nn.Linear((config.opportunity_tokens + 1) * d, d), nn.GELU(), nn.LayerNorm(d))
 
@@ -163,15 +170,23 @@ class BipartiteEncoder(nn.Module):
         pooled = self.pool(torch.cat((item_mean, resources.mean(1), global_f), dim=-1))
         if self.queries is not None:
             # Resources remain valid keys, including when a row has no candidates.
-            context = torch.cat((items, resources), dim=1)
-            mask = None if feasible is None else torch.cat((~feasible,
-                torch.zeros(resources.shape[:2], dtype=torch.bool, device=items.device)), 1)
             queries = self.queries[None].expand(items.shape[0], -1, -1) + pooled[:, None]
-            summary = self.opportunity_attention(queries, context, context,
-                                                  key_padding_mask=mask, need_weights=False)[0]
+            if self.balanced_attention is None:
+                context = torch.cat((items, resources), dim=1)
+                mask = None if feasible is None else torch.cat((~feasible,
+                    torch.zeros(resources.shape[:2], dtype=torch.bool, device=items.device)), 1)
+                summary = self.opportunity_attention(queries, context, context,
+                                                      key_padding_mask=mask, need_weights=False)[0]
+            else:
+                summary = self.balanced_attention(queries, items, resources, state.feasible)
             pooled = self.opportunity_pool(torch.cat((pooled, summary.flatten(1)), -1))
         if self.contrast_pool is not None:
             pooled = self.contrast_pool(items, pooled, relations)
+        if self.resource_refinement is not None:
+            cached = cached_features(state, c)
+            geometry = (resource_geometry(state, c) if cached is None else ResourceGeometry(
+                cached["resource_geometry"], cached["resource_relations"], cached["resource_pressure"]))
+            resources, pooled = self.resource_refinement(items, resources, pooled, geometry, state.feasible)
         return items, resources, pooled
 
 
@@ -202,6 +217,7 @@ class HighLevelController(nn.Module):
         super().__init__()
         self.config = config
         self.encoder = BipartiteEncoder(config, strategy=True)
+        self.readout = StrategyReadout(config) if config.actor_strategy_tokens else None
         # A linear concatenation makes the shared pooled term cancel in softmax.
         self.price_context = nn.Sequential(nn.Linear(3 * config.embed_dim, config.embed_dim), nn.GELU())
         self.price_head = nn.Linear(config.embed_dim, 1, bias=False)
@@ -225,12 +241,16 @@ class HighLevelController(nn.Module):
         items, resources, pooled = self.encoder(state)
         c = self.config
         m = resources.shape[1]
-        global_context = pooled[:, None, :].expand_as(resources)
+        roles = None if self.readout is None else self.readout(items, resources, pooled, state.feasible)
+        price_context = pooled if roles is None else roles[:, 6]
+        global_context = price_context[:, None, :].expand_as(resources)
         price_logits = self.price_head(self.price_context(torch.cat(
             (resources, global_context, resources * global_context), -1))).squeeze(-1)
         prices = c.price_floor + (1 - c.price_floor) * m * price_logits.softmax(-1)
-        controls = self.strategy_head(pooled).sigmoid()
-        interaction, companion = self.combination_head(resources, pooled)
+        controls = (self.strategy_head(pooled) if roles is None else
+                    (roles[:, :6] * self.strategy_head.weight[None]).sum(-1) + self.strategy_head.bias).sigmoid()
+        interaction, companion = (self.combination_head(resources, pooled) if roles is None else
+                                 self.combination_head(resources, roles[:, 7], roles[:, 8]))
         theta = StrategyTheta(
             prices,
             c.profit_exponent_min + (c.profit_exponent_max - c.profit_exponent_min) * controls[:, 0],

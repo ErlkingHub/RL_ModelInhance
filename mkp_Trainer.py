@@ -13,7 +13,8 @@ import time
 import numpy as np
 import torch
 from torch.nn import functional as F
-from mkp_config import (CHECKPOINT_VERSION, CONTROLLER_VERSION, DECODER_VERSION, ModelConfig, GeneratorConfig,
+from mkp_config import (CHECKPOINT_VERSION, CONTROLLER_VERSION, DECODER_VERSION, ACTOR_ARCHITECTURE_VERSION,
+                        ModelConfig, GeneratorConfig,
                         TrainConfig, config_dict)
 from mkp_data import synthetic_batch
 from mkp_env import MKPEnv, MKPState
@@ -103,7 +104,9 @@ class MKPTrainer:
                        "best_validation_return", "elapsed_seconds"]
         self.fields += ["ranking_proposed", "ranking_pairs", "ranking_abs_return_gap",
                         "ranking_standard_error", "ranking_label_seconds", "ranking_loss",
-                        "ranking_accuracy", "ranking_kl", "ranking_minibatches"]
+                        "ranking_accuracy", "ranking_kl", "ranking_minibatches",
+                        "ranking_states_labeled", "ranking_candidates_labeled",
+                        "ranking_confidence_mean", "ranking_greedy_conflicts"]
         self.fields += list(COMBINATION_METRICS)
         self.fields += list(PERFORMANCE_FIELDS)
         with (self.run_dir / "metrics.csv").open("w", newline="", encoding="utf-8") as f:
@@ -111,7 +114,8 @@ class MKPTrainer:
         write_json(self.run_dir / "config.json", {
             "train": config_dict(self.config), "model": config_dict(self.model_config),
             "generator": config_dict(self.generator_config), "torch": str(torch.__version__),
-            "device": str(self.device), "training_data_source": "synthetic_only"})
+            "device": str(self.device), "training_data_source": "synthetic_only",
+            "actor_implementation": ACTOR_ARCHITECTURE_VERSION})
 
     def ppo_update(self, model, optimizer, data, rollout, update=0):
         c = self.config
@@ -230,7 +234,7 @@ class MKPTrainer:
         saved = None
         if resume:
             model, saved = load_checkpoint(resume, self.device, m)
-            if saved["model_config"] != config_dict(self.model_config):
+            if config_dict(model.config) != config_dict(self.model_config):
                 raise ValueError("Resume model config differs; supply the original model settings")
             if saved["generator_config"] != config_dict(self.generator_config):
                 raise ValueError("Resume generator config differs")
@@ -336,6 +340,7 @@ class MKPTrainer:
             if improved or update % c.checkpoint_every == 0 or update == c.updates:
                 payload = {"checkpoint_version": CHECKPOINT_VERSION, "decoder_version": DECODER_VERSION,
                            "controller_version": CONTROLLER_VERSION,
+                           "actor_implementation": ACTOR_ARCHITECTURE_VERSION,
                            "model_config": config_dict(self.model_config), "train_config": config_dict(c),
                            "generator_config": config_dict(self.generator_config), "num_resources": m,
                            "training_data_source": "synthetic_only", "update": update,
@@ -385,18 +390,29 @@ def main(argv=None):
     parser.add_argument("--ranking-states", type=int, default=defaults.ranking_states)
     parser.add_argument("--ranking-pool-size", type=int, default=defaults.ranking_pool_size)
     parser.add_argument("--ranking-repeats", type=int, default=defaults.ranking_repeats)
+    parser.add_argument("--ranking-target-mode", choices=("dense_greedy", "legacy_mixed"),
+                        default=defaults.ranking_target_mode)
+    parser.add_argument("--ranking-candidates", type=int, default=defaults.ranking_candidates)
+    parser.add_argument("--ranking-min-gap", type=float, default=defaults.ranking_min_gap)
+    parser.add_argument("--ranking-return-scale", type=float, default=defaults.ranking_return_scale)
+    parser.add_argument("--ranking-branch-chunk-size", type=int, default=defaults.ranking_branch_chunk_size)
+    parser.add_argument("--ranking-confidence-floor", type=float, default=defaults.ranking_confidence_floor)
     parser.add_argument("--opportunity-weight-max", type=float, default=model_defaults.opportunity_weight_max)
     parser.add_argument("--reserve-weight-max", type=float, default=model_defaults.reserve_weight_max)
     parser.add_argument("--opportunity-tokens", type=int, default=model_defaults.opportunity_tokens)
     parser.add_argument("--actor-edge-values", action=argparse.BooleanOptionalAction,
                         default=model_defaults.actor_edge_values)
     for field in ("actor_postdecision_features", "actor_pair_attention", "actor_contrast_pooling",
-                  "actor_feasible_attention"):
+                  "actor_feasible_attention", "actor_resource_refinement", "actor_type_balanced_pooling",
+                  "actor_strategy_tokens"):
         parser.add_argument("--" + field.replace("_", "-"), action=argparse.BooleanOptionalAction,
                             default=getattr(model_defaults, field))
     parser.add_argument("--actor-relation-chunk-size", type=int, default=model_defaults.actor_relation_chunk_size)
     parser.add_argument("--actor-relation-bandwidth", type=float, default=model_defaults.actor_relation_bandwidth)
     parser.add_argument("--actor-similarity-bandwidth", type=float, default=model_defaults.actor_similarity_bandwidth)
+    parser.add_argument("--actor-resource-gate-init", type=float, default=model_defaults.actor_resource_gate_init)
+    parser.add_argument("--actor-resource-gate-max", type=float, default=model_defaults.actor_resource_gate_max)
+    parser.add_argument("--actor-readout-initial-scale", type=float, default=model_defaults.actor_readout_initial_scale)
     parser.add_argument("--interaction-weight-max", type=float, default=model_defaults.interaction_weight_max)
     parser.add_argument("--companion-weight-max", type=float, default=model_defaults.companion_weight_max)
     parser.add_argument("--combination-initial-weight", type=float, default=model_defaults.combination_initial_weight)
@@ -409,6 +425,10 @@ def main(argv=None):
                          runs_dir=args.runs_dir, ranking_coefficient=args.ranking_coefficient,
                          ranking_states=args.ranking_states, ranking_pool_size=args.ranking_pool_size,
                          ranking_repeats=args.ranking_repeats, performance_profile=args.performance_profile,
+                         ranking_target_mode=args.ranking_target_mode, ranking_candidates=args.ranking_candidates,
+                         ranking_min_gap=args.ranking_min_gap, ranking_return_scale=args.ranking_return_scale,
+                         ranking_branch_chunk_size=args.ranking_branch_chunk_size,
+                         ranking_confidence_floor=args.ranking_confidence_floor,
                          feature_cache_gib=args.feature_cache_gib, cache_headroom_gib=args.cache_headroom_gib,
                          feature_cache_batch_size=args.feature_cache_batch_size)
     model = ModelConfig(opportunity_weight_max=args.opportunity_weight_max,
@@ -418,6 +438,12 @@ def main(argv=None):
                         actor_pair_attention=args.actor_pair_attention,
                         actor_contrast_pooling=args.actor_contrast_pooling,
                         actor_feasible_attention=args.actor_feasible_attention,
+                        actor_resource_refinement=args.actor_resource_refinement,
+                        actor_resource_gate_init=args.actor_resource_gate_init,
+                        actor_resource_gate_max=args.actor_resource_gate_max,
+                        actor_type_balanced_pooling=args.actor_type_balanced_pooling,
+                        actor_strategy_tokens=args.actor_strategy_tokens,
+                        actor_readout_initial_scale=args.actor_readout_initial_scale,
                         actor_relation_chunk_size=args.actor_relation_chunk_size,
                         actor_relation_bandwidth=args.actor_relation_bandwidth,
                         actor_similarity_bandwidth=args.actor_similarity_bandwidth,

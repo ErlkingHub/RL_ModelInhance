@@ -137,8 +137,10 @@ def benchmark(config=None):
                             "checkpoint_version": payload["checkpoint_version"],
                             "controller_version": payload["controller_version"],
                             "decoder_version": payload["decoder_version"],
+                            "actor_implementation": payload.get("actor_implementation", "legacy_v5"),
                             "update": payload["update"], "model_config": payload["model_config"],
                             "train_num_items": payload["train_config"]["train_num_items"],
+                            "ranking_target_mode": payload["train_config"].get("ranking_target_mode", "legacy_mixed"),
                             "training_data_source": payload["training_data_source"],
                             "training_diagnostics": training_diagnostics(payload, m)}
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
