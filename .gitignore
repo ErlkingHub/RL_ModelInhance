@@ -1,5 +1,5 @@
 # My Python.gitignore template
-*dataset*
+dataset
 runs/
 checkpoints/
 *results/
