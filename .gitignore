@@ -2,8 +2,12 @@
 dataset
 runs/
 checkpoints/
-*results/
+# results/
 outputs
+.vscode/
+
+!results/20261022_195937_430788/summary.csv
+!results/20261022_195937_430788/instances.csv
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
