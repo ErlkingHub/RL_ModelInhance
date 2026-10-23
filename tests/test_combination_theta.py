@@ -13,6 +13,7 @@ from mkp_Model import MKPModel, WeakDecoder, CandidatePolicy
 from mkp_ranking import ranking_objective
 from mkp_Trainer import collect_rollout, main
 from test_opportunity_ranking import critical_state, labeled_batch
+from mkp_test_helpers import synthetic_theta
 
 
 def complementary_state(device="cpu"):
@@ -32,7 +33,7 @@ class CombinationThetaTests(unittest.TestCase):
     def test_pair_bonus_exposes_better_combination_than_high_density_single_item(self):
         state = complementary_state()
         decoder = WeakDecoder(self.config)
-        theta = decoder.fixed_theta(state)
+        theta = synthetic_theta(state, self.config)
         self.assertEqual(decoder(state, theta).choose().item(), 0)
         theta.companion_weights[0, 0] = 2
         policy = decoder(state, theta)
@@ -52,7 +53,7 @@ class CombinationThetaTests(unittest.TestCase):
                        torch.tensor([[[1., 1.], [1., 3.], [3., 1.], [3., 3.]]]),
                        torch.ones(1, 2) * 8).state
         decoder = WeakDecoder(self.config)
-        theta = decoder.fixed_theta(state)
+        theta = synthetic_theta(state, self.config)
         theta.resource_interactions[0, 0, 1] = theta.resource_interactions[0, 1, 0] = 1
         penalty = decoder(state, theta).score_terms["interaction_penalty"]
         mixed = penalty[3] - penalty[2] - penalty[1] + penalty[0]
@@ -60,7 +61,7 @@ class CombinationThetaTests(unittest.TestCase):
         # Equal profit and summed resource cost; old formula favors A on bottleneck.
         state = MKPEnv(torch.tensor([[10., 10.]]), torch.tensor([[[6., 6.], [10., 2.]]]),
                        torch.tensor([[10., 10.]])).state
-        theta = decoder.fixed_theta(state)
+        theta = synthetic_theta(state, self.config)
         self.assertEqual(decoder(state, theta).choose().item(), 0)
         theta.resource_interactions[0, 0, 1] = theta.resource_interactions[0, 1, 0] = 2
         self.assertEqual(decoder(state, theta).choose().item(), 1)
@@ -68,7 +69,7 @@ class CombinationThetaTests(unittest.TestCase):
     def test_formula_matches_independent_scalar_reference(self):
         state = critical_state()
         decoder = WeakDecoder(self.config)
-        theta = decoder.fixed_theta(state)
+        theta = synthetic_theta(state, self.config)
         theta.resource_interactions[0] = torch.tensor([[.3, .8], [.8, .2]])
         theta.companion_weights[0] = torch.tensor([.2, .6, .7])
         policy = decoder(state, theta)

@@ -1,6 +1,5 @@
 """Reproducibility, checkpoint contracts and shared constructive inference."""
 import hashlib
-from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -9,7 +8,7 @@ import numpy as np
 import torch
 from mkp_config import CHECKPOINT_VERSION, CONTROLLER_VERSION, DECODER_VERSION, ModelConfig
 from mkp_env import MKPEnv
-from mkp_Model import MKPModel, WeakDecoder
+from mkp_Model import MKPModel
 from mkp_basis import decoder_statistics
 
 
@@ -75,24 +74,16 @@ def load_checkpoint(path, device, expected_m=None):
 
 
 @torch.no_grad()
-def construct_solution(data, model=None, mode="learned_dynamic", stochastic=False, model_config=None):
-    """Full constructive episode, no repair/search. Used only by explicit train/benchmark runs."""
-    if mode not in ("fixed", "learned_static", "learned_dynamic"):
-        raise ValueError(mode)
-    if mode != "fixed" and model is None:
-        raise ValueError("A model is required for learned inference")
+def construct_solution(data, model):
+    """Recompute state-conditioned theta at every step and take its greedy action.
+
+    The sole constructive inference path uses the trained controller and the
+    transparent decoder, with no repair, search, or alternative rollout budget.
+    """
+    if model is None:
+        raise ValueError("A trained model is required for constructive inference")
     env = MKPEnv(*data)
-    decoder = model.decoder if model is not None else WeakDecoder(model_config or ModelConfig())
-    if mode == "fixed":
-        # The original density baseline has zero opportunity weights: avoid
-        # charging its runtime for pairwise features it never uses.
-        decoder = WeakDecoder(replace(decoder.config, opportunity_weight_max=0, reserve_weight_max=0,
-                                      interaction_weight_max=0, companion_weight_max=0))
-    if model is not None:
-        model.eval()
-    theta = decoder.fixed_theta(env.state) if mode == "fixed" else None
-    if mode == "learned_static":
-        theta = model.actor(env.state)[0]
+    model.eval()
     sequences = []
     theta_sum = torch.zeros(data[0].shape[0], 9, device=data[0].device)
     decoder_sum = torch.zeros(data[0].shape[0], 4, device=data[0].device)
@@ -101,10 +92,9 @@ def construct_solution(data, model=None, mode="learned_dynamic", stochastic=Fals
         active = env.state.active
         if not active.any():
             break
-        if mode == "learned_dynamic":
-            theta = model.actor(env.state)[0]
-        policy = decoder(env.state, theta)
-        actions = policy.choose(stochastic)
+        theta = model.actor(env.state)[0]
+        policy = model.decoder(env.state, theta)
+        actions = policy.choose()
         stats = theta.statistics()
         theta_sum += stats * active[:, None]
         decoder_sum += decoder_statistics(policy) * active[:, None]

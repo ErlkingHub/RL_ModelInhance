@@ -19,6 +19,7 @@ from mkp_utils import atomic_checkpoint, load_checkpoint
 from test_contracts import toy_state
 from test_opportunity_ranking import critical_state, labeled_batch
 from mkp_ranking import ranking_objective
+from mkp_test_helpers import synthetic_theta
 
 
 class StrategyReadoutTests(unittest.TestCase):
@@ -55,7 +56,7 @@ class StrategyReadoutTests(unittest.TestCase):
 
     def test_all_architecture_ablations_keep_pair_channel_critic_and_fixed_score(self):
         state = critical_state()
-        theta = WeakDecoder(self.config).fixed_theta(state)
+        theta = synthetic_theta(state, self.config)
         theta.companion_weights.fill_(.3)
         expected = WeakDecoder(self.config)(state, theta).logits
         for refinement, balanced, tokens in itertools.product((False, True), repeat=3):
@@ -145,7 +146,7 @@ class StrategyReadoutTests(unittest.TestCase):
                   "--actor-resource-gate-init", ".15", "--actor-readout-initial-scale", ".2",
                   "--ranking-target-mode", "legacy_mixed", "--ranking-candidates", "6"])
         train, config = trainer.call_args.args
-        self.assertEqual(train.checkpoint_dir.name, "resource_strategy_v2")
+        self.assertEqual(train.checkpoint_dir.name, "regret_margin_v2")
         self.assertEqual((train.ranking_target_mode, train.ranking_candidates), ("legacy_mixed", 6))
         self.assertFalse(config.actor_resource_refinement or config.actor_type_balanced_pooling or config.actor_strategy_tokens)
         self.assertEqual((config.actor_resource_gate_init, config.actor_readout_initial_scale), (.15, .2))

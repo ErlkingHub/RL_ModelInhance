@@ -4,7 +4,7 @@
 
 目标是在 `MKP_dataset/Benchmarks_Chu.mat` 上研究接近或低于 **0.1% gap** 的解。该目标需要实验验证，代码交付本身不代表达到该精度。默认训练与测试均由使用者运行。
 
-当前默认结构为 **resource_strategy_v2**：保留 combination θ v5、原物品组合通道和固定弱解码器，增加资源关系残差、按类型分别聚合的九角色策略读出，以及对齐 greedy 的精细终局排序监督。详细设计、训练/评估命令及独立消融见 [RESOURCE_STRATEGY_V2.md](RESOURCE_STRATEGY_V2.md)。新结构需要重新训练，默认目录为 `checkpoints/resource_strategy_v2/`；旧 v5 checkpoint 仍可严格加载原网络用于评估。
+当前网络结构为 **resource_strategy_v2**：保留 combination θ v5、原物品组合通道和固定弱解码器，采用资源关系残差和九角色策略读出，结构说明见 [RESOURCE_STRATEGY_V2.md](RESOURCE_STRATEGY_V2.md)。当前学习目标修复见 [LEARNING_REPAIR_V2.md](LEARNING_REPAIR_V2.md)，训练/评估默认目录为 `checkpoints/regret_margin_v2/`；网络和θ合约未改变，旧 v5 checkpoint 仍可严格加载评估，新损失应开始独立训练实验。
 
 θ/解码器合约仍为 checkpoint schema 5、控制器 `combination_theta_v5`、解码器 `second_order_density_v5`；完整网络开关保存在 `model_config`。下面 v3/v4/v5 小节说明所保留机制的来源，新的默认结构与排序标签以本节链接的说明为准。
 
@@ -29,7 +29,7 @@ python train_ConstrainedMKP.py --performance-profile reference
 # 只关闭跨 epoch 的整批状态缓存，保留大分块和单次前向内的特征复用
 python train_ConstrainedMKP.py --performance-profile memory24 --feature-cache-gib 0
 # 从本次新结构 checkpoint 续训；updates 是累计更新次数，原模型参数需保持一致
-python train_ConstrainedMKP.py --resources 5 --resume checkpoints/resource_strategy_v2/mkp_M5_last.pt --updates 4000
+python train_ConstrainedMKP.py --resources 5 --resume checkpoints/regret_margin_v2/mkp_M5_last.pt --updates 4000
 ```
 
 **执行 profile 本身不改变模型结构；本次新增的资源增强和策略读出则需要重新训练。** 执行设置单独保存到 `runtime_M5.json` / `runtime_M10.json` 和 checkpoint 的 `training_runtime`；`--resume` 可更改缓存预算或执行 profile。扩大矩阵分块可能造成浮点舍入差异，不能承诺长程采样/训练逐位相同。独立 Benchmark 按 checkpoint 原模型配置推理。
@@ -80,8 +80,8 @@ python profile_training_speed.py --output outputs/performance_probe.json
 
 ```powershell
 # 自行运行：当前默认结构，保留完整 v5 评分
-python train_ConstrainedMKP.py --checkpoint-dir checkpoints/resource_strategy_v2
-python Benchmark_zeroShot.py --checkpoint-dir checkpoints/resource_strategy_v2
+python train_ConstrainedMKP.py --checkpoint-dir checkpoints/regret_margin_v2
+python Benchmark_zeroShot.py --checkpoint-dir checkpoints/regret_margin_v2
 # 自行运行：同一 Actor、上一版评分的对照，需要单独重新训练
 python train_ConstrainedMKP.py --interaction-weight-max 0 --companion-weight-max 0 --checkpoint-dir checkpoints/ablation_v4_score
 python Benchmark_zeroShot.py --checkpoint-dir checkpoints/ablation_v4_score
@@ -139,12 +139,14 @@ python Benchmark_zeroShot.py --checkpoint-dir checkpoints/ablation_v4_score
 # 自行运行：只训练一个资源维度
 & 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' train_ConstrainedMKP.py --resources 5 --updates 2000
 # 自行运行：从 last checkpoint 继续，updates 是累计更新次数目标
-& 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' train_ConstrainedMKP.py --resources 5 --resume checkpoints/resource_strategy_v2/mkp_M5_last.pt --updates 4000
-# 可选：另报 128 条随机轨迹中的最佳解，不替代单轨迹 greedy 结果
-& 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' Benchmark_zeroShot.py --sample-rollouts 128
+& 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe' train_ConstrainedMKP.py --resources 5 --resume checkpoints/regret_margin_v2/mkp_M5_last.pt --updates 4000
 ```
 
 其余参数集中在 `mkp_config.py`，包括模型、生成器、PPO、日志、checkpoint、benchmark。`--help` 只显示参数，不运行实验。运行目录不会影响默认数据和产物路径。
+
+诊断当前瓶颈时，先按 [DIAGNOSTIC_WORKFLOW.md](DIAGNOSTIC_WORKFLOW.md) 运行独立合成状态审计，分别检查合法 θ 可达性、Actor 学习及 PPO 更新后的保持。无需先重训，诊断产物不会覆盖正式 checkpoint。
+
+v1诊断的结果分析、收益margin学习目标修复及匹配诊断/训练命令见 [LEARNING_REPAIR_V2.md](LEARNING_REPAIR_V2.md)。当前训练默认采用 `--ranking-loss-type regret_margin`；原目标可用 `--ranking-loss-type soft_bce` 复现，旧运行恢复也需显式使用该旧目标。
 
 ## 模块与输出
 
@@ -165,16 +167,17 @@ python Benchmark_zeroShot.py --checkpoint-dir checkpoints/ablation_v4_score
 | `train_ConstrainedMKP.py` | 简洁训练入口                                              |
 | `Benchmark_zeroShot.py`   | 冻结推理、独立解校验、CSV 与物品序列                      |
 | `compare_mkp_results.py`  | 保存结果的严格配对对照及平均 gap <0.1% 核验              |
+| `diagnose_mkp.py`         | 独立合成状态的可达性、拟合、PPO 保持及报告入口             |
 | `mkp_utils.py`            | 复现设置、checkpoint 合约、共享构造过程                   |
 | `tests/test_contracts.py` | 小张量接口与梯度校验，不执行训练或 benchmark              |
 
 - `runs/<时间戳>/train.log`：每次更新的日志。
 - `runs/<时间戳>/metrics.csv`：收益、归一化 return、利用率、PPO 各项损失、归一化 entropy、KL、梯度范数、Critic explained variance、合成验证表现。
 - `runs/<时间戳>/config.json`：配置与运行环境。
-- `checkpoints/resource_strategy_v2/mkp_M5_best.pt`、同目录 `mkp_M10_best.pt`：按固定合成验证集的 greedy 归一化收益选择。
-- `checkpoints/resource_strategy_v2/mkp_M5_last.pt`、同目录 `mkp_M10_last.pt`：最近一次保存的模型，包含优化器和 RNG 状态；默认每 100 次更新、产生新 best 及训练结束时保存。
-- `results/<时间戳>/instances.csv`：逐实例、逐方法报告。
-- `results/<时间戳>/summary.csv`：每种方法按 M/N 分组及总体报告。
+- `checkpoints/regret_margin_v2/mkp_M5_best.pt`、同目录 `mkp_M10_best.pt`：按固定合成验证集的 greedy 归一化收益选择。
+- `checkpoints/regret_margin_v2/mkp_M5_last.pt`、同目录 `mkp_M10_last.pt`：最近一次保存的模型，包含优化器和 RNG 状态；默认每 100 次更新、产生新 best 及训练结束时保存。
+- `results/<时间戳>/instances.csv`：每个实例一行 learned_dynamic 报告。
+- `results/<时间戳>/summary.csv`：learned_dynamic 按 M/N 分组及总体报告。
 - `results/<时间戳>/solutions.jsonl`：零基索引物品选择顺序，可独立复核。
 - `results/<时间戳>/manifest.json`：数据及 checkpoint SHA256、预算、设备、配置、运行状态。
 
@@ -297,7 +300,7 @@ pi_i    = softmax(score_i / temperature)，只在可行候选集合中归一化
 
 零总资源消耗的物品用 eps 成本处理；数值实现使用 log-sum-exp。默认固定对照为 price=1、α=1、β=1、κ=0.1、τ=0.2、λ=ρ=0、A=b=0，保留原始密度基线。网络初始化为同样的密度参数，λ=ρ=0.1，A 的上三角系数总和与 b 的系数总和默认各为 0.02。
 
-弱解码器没有可训练参数、物品指针网络、局部搜索、修复、beam search 或优化求解器。设每行可行候选数为 F：原始密度评分约 `O(FM)`，原机会项 `O(FNM)`，新增交互项 `O(FM²)`，搭配项 `O(FN(M+K))`。原机会项按 128 个候选分块，新搭配项按 `combination_chunk_size=64` 分块，临时空间约 `O(64N(M+K))`；没有枚举候选 i 之后所有 j/k 三元组合。`fixed` 对照会跳过所有未使用的机会及组合计算。无参数并不等于无推理开销。
+弱解码器没有可训练参数、物品指针网络、局部搜索、修复、beam search 或优化求解器。设每行可行候选数为 F：原始密度评分约 `O(FM)`，原机会项 `O(FNM)`，新增交互项 `O(FM²)`，搭配项 `O(FN(M+K))`。原机会项按 128 个候选分块，新搭配项按 `combination_chunk_size=64` 分块，临时空间约 `O(64N(M+K))`；没有枚举候选 i 之后所有 j/k 三元组合。无参数并不等于无推理开销。
 
 ### 新增二阶与搭配基函数
 
@@ -351,13 +354,16 @@ h = opportunity_bandwidth = 0.05
 候选从同一状态分别强制选择后，由**本次更新前、参数固定的策略**完成 1 次 greedy 和 4 次随机续行，后者共享物品噪声。用 greedy 终局收益最高的候选对比其余候选；收益差减去公共已选前缀，再以最优候选的剩余收益归一化。保留 float64 标签，默认过滤阈值仅为 1e-6；随机意见冲突只降低置信度，不反转 greedy 方向。该标签是有限候选的策略续行证据，不是最优 Q 值或 oracle。旧的 50/50 混合与硬过滤可通过 `--ranking-target-mode legacy_mixed` 及原阈值复现，命令见新版说明。
 
 ```text
-target = sigmoid(delta / ranking_return_scale)
 margin = (score_i - score_j) / ranking_score_scale
-ranking_loss = mean(state_weight * confidence * BCEWithLogits(margin, target))
+u = abs(delta) / ranking_return_scale
+violation = relu(min(u, ranking_margin_cap) - sign(delta) * margin)
+ranking_loss = mean(state_weight * confidence * min(u,1) * Huber(violation))
 total_loss = 原 PPO/Value/可行性/Entropy 损失 + 0.1 * ranking_loss
 ```
 
 排序使用温度缩放**之前**的 score，模型不能只调低采样温度来满足排序监督。标签及续行均无梯度；梯度由固定 score 经 θ 回到 Actor，不进入 Critic。反事实分支不进入 PPO buffer，不改变 GAE/Value 的目标。每个 PPO minibatch 另外计算整个标签状态集合的全候选 KL，超过 `target_kl` 即停止后续更新，避免只检查已采样动作而遗漏其他候选的概率漂移。标签使用独立 RNG，不消耗主 rollout 随机流。
+
+默认 `--ranking-loss-type regret_margin` 在满足有限margin后停止推动该动作对；`--ranking-loss-type soft_bce` 恢复原 `BCEWithLogits(margin,sigmoid(delta/return_scale))`。收益margin有界不表示整个网络参数梯度有界，仍使用原梯度裁剪与PPO/KL停止。
 
 `metrics.csv` / `train.log` 记录标签提议/接受数、平均终局收益差、标准误、标签耗时、排序损失、排序方向正确率和全候选 KL。`ranking_accuracy` 是当轮被接受训练对上的方向正确率；没有接受对时记 0，应结合 `ranking_pairs` 阅读，不能当作独立验证精度。Benchmark 记录原有 θ 均值及新增组合指标，checkpoint/manifest 保存 v5 控制器、解码器标识与完整模型配置。推理不执行反事实续行。
 
@@ -390,18 +396,13 @@ python Benchmark_zeroShot.py --checkpoint-dir checkpoints/ablation_no_ranking
 
 训练与 checkpoint 选择不读取 Chu。测试程序只读取冻结 checkpoint；N=100 是未见实例测试，N=250/500 在默认配置下同时是跨规模 zero-shot。CSV 中 `size_zero_shot` 根据 checkpoint 中记录的训练 N 自动标记。如果自己在训练配置加入 N=250，则该规模不再标记为跨规模测试。
 
-### 对照与指标
+### 推理与指标
 
-默认对每个实例分别报告：
+每个实例仅执行 `learned_dynamic`：每步根据当前状态重算 θ，通过固定弱解码器执行一次 greedy 选择，直到没有可行物品；只报告这一条轨迹。
 
-1. `fixed`：固定 θ，动态环境仍按当前容量计算评分。
-2. `learned_static`：仅在初始状态产生一次 θ，整个构造过程复用。
-3. `learned_dynamic`：每步重算 θ，单轨迹 greedy，作为主要方法结果。
-4. 可选 `learned_dynamic_sampled`：独立报告 K 条随机轨迹的最好结果及完整时间预算，不与单轨迹合并。
+`gap_pct = 100 * (best - objective) / best`，其中 best 来自 MAT 文件；仅标记为 **best-known reference**，不声称已经验证其全局最优性。保留负 gap 并标记 `reference_exceeded`，避免截断掩盖数据问题或更好解。
 
-主要比较 dynamic 对 fixed 的提升，及 dynamic 对 static 的提升，后者检验动态状态感知的价值。`gap_pct = 100 * (best - objective) / best`，其中 best 来自 MAT 文件；仅标记为 **best-known reference**，不声称已经验证其全局最优性。保留负 gap 并标记 `reference_exceeded`，避免截断掩盖数据问题或更好解。
-
-报告包括平均/中位/最差 gap、≤0.1% 的实例比例、原始收益、逐资源利用率、选中数量、可行性、独立重算容量违约量、时间、采样预算和策略统计。只看平均 gap≤0.1% 并不意味着每个实例达标，应同时查看 worst gap 和 target hit rate。时间经过 CUDA 同步，不含 checkpoint 加载，含数据搬运和整条解构造；不做预热，首实例可能包含初始化开销。
+报告包括平均/中位/最差 gap、严格 <0.1% 的实例比例、原始收益、逐资源利用率、选中数量、可行性、独立重算容量违约量、完整构造时间和策略统计。平均 gap <0.1% 不意味着每个实例达标，应同时查看 worst gap 和 target hit rate。时间经过 CUDA 同步，不含 checkpoint 加载，含数据搬运和整条解构造；不做预热，首实例可能包含初始化开销。
 
 新增数据集：若遵循现有 `read_mat` 字段布局，可使用 `--dataset`；其他布局应新增读取适配器，统一转换为 `MKPInstance`。不猜测未知 MAT 格式，也不把缺失 best 当成零 gap。
 

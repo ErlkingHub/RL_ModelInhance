@@ -13,6 +13,7 @@ from mkp_ranking import (RankingBatch, paired_terminal_returns, return_targets,
                          collect_ranking_batch, ranking_objective, ranking_kl)
 from mkp_Trainer import MKPTrainer
 from mkp_utils import atomic_checkpoint, load_checkpoint, construct_solution
+from mkp_test_helpers import synthetic_theta
 
 
 def critical_state(device="cpu"):
@@ -44,7 +45,7 @@ class OpportunityTests(unittest.TestCase):
     def test_similar_items_flip_towards_preserved_future_item(self):
         state = critical_state()
         decoder = WeakDecoder(self.config)
-        theta = decoder.fixed_theta(state)
+        theta = synthetic_theta(state, self.config)
         self.assertEqual(decoder(state, theta).choose().item(), 0)
         theta.opportunity_weight.fill_(1.)
         self.assertEqual(decoder(state, theta).choose().item(), 1)
@@ -104,7 +105,7 @@ class OpportunityTests(unittest.TestCase):
         theta = model.actor(state)[0]
         with patch.object(model.decoder, "opportunity_features", side_effect=AssertionError("disabled")):
             actual = model.decoder(state, theta)
-        torch.testing.assert_close(actual.logits, model.decoder(state, model.decoder.fixed_theta(state)).logits)
+        torch.testing.assert_close(actual.logits, model.decoder(state, synthetic_theta(state, config)).logits)
         self.assertFalse(any("opportunity" in name or "edge_value" in name
                              for name, _ in model.critic_encoder.named_parameters()))
 
@@ -275,14 +276,11 @@ class OpportunityTests(unittest.TestCase):
     def test_tiny_inference_stats_include_new_theta(self):
         state = critical_state()
         model = MKPModel(self.config)
-        for mode in ("fixed", "learned_static", "learned_dynamic"):
-            result = construct_solution((state.profits, state.weights, state.capacities), model, mode)
-            self.assertEqual(result["theta_mean"].shape, (1, 9))
-            self.assertEqual(result["decoder_mean"].shape, (1, 4))
-            self.assertTrue(torch.isfinite(result["theta_mean"]).all())
-            self.assertTrue((result["remaining"] >= 0).all())
-        with patch.object(WeakDecoder, "opportunity_features", side_effect=AssertionError("fixed baseline")):
-            construct_solution((state.profits, state.weights, state.capacities), model, "fixed")
+        result = construct_solution((state.profits, state.weights, state.capacities), model)
+        self.assertEqual(result["theta_mean"].shape, (1, 9))
+        self.assertEqual(result["decoder_mean"].shape, (1, 4))
+        self.assertTrue(torch.isfinite(result["theta_mean"]).all())
+        self.assertTrue((result["remaining"] >= 0).all())
 
     def test_global_context_changes_relative_prices(self):
         model = MKPModel(self.config)

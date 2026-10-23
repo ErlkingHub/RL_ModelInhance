@@ -111,7 +111,8 @@ class ConvergenceTests(unittest.TestCase):
                                  checkpoint_dir=root / "checkpoints", device="cpu")
             model = ModelConfig(embed_dim=8, num_heads=2, num_layers=1)
 
-            def fake_solution(data, *args, **kwargs):
+            def fake_solution(data, model):
+                self.assertIsNotNone(model)
                 return {"objective": data[0].sum(-1) * .5}
 
             def fake_rollout(model, data):
@@ -137,6 +138,10 @@ class ConvergenceTests(unittest.TestCase):
                 checkpoint = root / "checkpoints" / "mkp_M5_last.pt"
                 payload = torch.load(checkpoint, weights_only=True)
                 self.assertEqual(len(payload["diagnostics_history"]), 5)
+                self.assertNotIn("validation_improvement_pct", trainer.fields)
+                self.assertTrue(all("validation_improvement_pct" not in row
+                                    for row in payload["diagnostics_history"]))
+                self.assertEqual(report["scope"], "synthetic_learned_dynamic_greedy_validation_only")
                 self.assertEqual(payload["training_runtime"]["profile"], "reference")
                 self.assertEqual(training_diagnostics(payload, 5)["report_status"], "available")
                 config.updates = 8

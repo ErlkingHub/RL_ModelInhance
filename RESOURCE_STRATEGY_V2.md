@@ -48,7 +48,7 @@ flowchart LR
 ```powershell
 $mkpPython = 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe'
 & $mkpPython train_ConstrainedMKP.py --resources 5 10 --updates 2000 --device cuda --checkpoint-dir checkpoints/resource_strategy_v2
-& $mkpPython Benchmark_zeroShot.py --checkpoint-dir checkpoints/resource_strategy_v2 --sample-rollouts 0 --device cuda
+& $mkpPython Benchmark_zeroShot.py --checkpoint-dir checkpoints/resource_strategy_v2 --device cuda
 ```
 
 需要从新结构重新训练。旧 v5 checkpoint 可严格加载原结构用于评估；缺失的新开关会显式关闭新模块。不要用旧模型的 `--resume` 启动新结构。新训练和评估默认目录均为 `checkpoints/resource_strategy_v2`，避免覆盖历史目录。

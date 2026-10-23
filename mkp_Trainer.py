@@ -21,6 +21,7 @@ from mkp_env import MKPEnv, MKPState
 from mkp_Model import MKPModel
 from mkp_basis import COMBINATION_METRICS, decoder_statistics
 from mkp_ranking import collect_ranking_batch, ranking_objective, ranking_kl
+from mkp_actor_guard import ACTOR_GUARD_FIELDS, ActorUpdateGuard, build_optimizer
 from mkp_performance import (GIB, PERFORMANCE_FIELDS, configure_training_runtime,
                              build_rollout_cache, prepare_state)
 from mkp_diagnostics import convergence_report, plot_training, prepare_plotting
@@ -80,6 +81,14 @@ def collect_rollout(model, data):
     return result
 
 
+def validate_actor_resume(config, saved_train):
+    """Keep optimizer group layout and Actor acceptance semantics on resume."""
+    for key, default in (("actor_learning_rate", None), ("actor_continuation_guard", False),
+                         ("actor_guard_states", 8), ("actor_guard_tolerance", 0.0)):
+        if saved_train.get(key, default) != getattr(config, key):
+            raise ValueError(f"Resume requires unchanged {key}; start a separate controlled experiment")
+
+
 class MKPTrainer:
     def __init__(self, train=None, model=None, generator=None):
         self.config = train or TrainConfig()
@@ -100,7 +109,7 @@ class MKPTrainer:
         self.fields = ["M", "N", "update", "transitions", "objective_mean", "normalized_return",
                        "utilization", "policy_loss", "value_loss", "constraint_aux_loss",
                        "entropy", "approx_kl", "clip_fraction", "grad_norm", "explained_variance",
-                       "minibatches", "kl_stopped", "validation_return", "validation_improvement_pct",
+                       "minibatches", "kl_stopped", "validation_return",
                        "best_validation_return", "elapsed_seconds"]
         self.fields += ["ranking_proposed", "ranking_pairs", "ranking_abs_return_gap",
                         "ranking_standard_error", "ranking_label_seconds", "ranking_loss",
@@ -108,6 +117,7 @@ class MKPTrainer:
                         "ranking_states_labeled", "ranking_candidates_labeled",
                         "ranking_confidence_mean", "ranking_greedy_conflicts"]
         self.fields += list(COMBINATION_METRICS)
+        self.fields += list(ACTOR_GUARD_FIELDS) + ["actor_minibatches_applied"]
         self.fields += list(PERFORMANCE_FIELDS)
         with (self.run_dir / "metrics.csv").open("w", newline="", encoding="utf-8") as f:
             csv.DictWriter(f, fieldnames=self.fields).writeheader()
@@ -117,7 +127,7 @@ class MKPTrainer:
             "device": str(self.device), "training_data_source": "synthetic_only",
             "actor_implementation": ACTOR_ARCHITECTURE_VERSION})
 
-    def ppo_update(self, model, optimizer, data, rollout, update=0):
+    def ppo_update(self, model, optimizer, data, rollout, update=0, audit_observer=None):
         c = self.config
         # No parameter update has occurred since collection: this is the frozen
         # behavior policy. Branches never enter the PPO buffer or critic targets.
@@ -136,6 +146,7 @@ class MKPTrainer:
         old_values = rollout["values"][times, batches]
         old_log_probs = rollout["log_probs"][times, batches]
         actions = rollout["actions"][times, batches]
+        actor_guard = ActorUpdateGuard(model, optimizer, data, rollout, c)
         model.train()
         metric_names = ("policy_loss", "value_loss", "constraint_aux_loss", "entropy",
                         "approx_kl", "clip_fraction", "grad_norm")
@@ -163,6 +174,10 @@ class MKPTrainer:
                     raise FloatingPointError("Non-finite ranking KL")
                 max_ranking_kl = max(max_ranking_kl, full_ranking_kl)
                 if max(approximate_kl.item(), full_ranking_kl) > c.target_kl:
+                    if audit_observer is not None:
+                        audit_observer({"event": "kl_stop",
+                                        "ppo_kl": float(approximate_kl.detach()),
+                                        "ranking_kl": full_ranking_kl})
                     stopped = True
                     break
                 surrogate = ratio * normalized_adv[ids]
@@ -181,6 +196,12 @@ class MKPTrainer:
                     loss = loss + c.ranking_coefficient * rank_loss
                 if not torch.isfinite(loss):
                     raise FloatingPointError("Non-finite PPO loss")
+                if audit_observer is not None:
+                    audit_observer({"event": "before_backward", "losses": {
+                        "policy": policy_loss, "value": c.value_coefficient * value_loss,
+                        "feasibility": c.constraint_aux_coefficient * constraint_loss,
+                        "entropy": -c.entropy_coefficient * entropy,
+                        "ranking": c.ranking_coefficient * rank_loss if ranking is not None else None}})
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), c.max_grad_norm,
@@ -200,6 +221,9 @@ class MKPTrainer:
         explained = (1 - (targets - old_values).var(unbiased=False) / variance).item() if variance > 1e-12 else float("nan")
         result = dict(zip(metric_names, (sums / max(1, observations)).tolist()))
         result.update(minibatches=minibatches, kl_stopped=int(stopped), explained_variance=explained)
+        guard_stats = actor_guard.finish()
+        result.update(guard_stats, actor_minibatches_applied=(
+            0 if guard_stats["actor_guard_rejected"] else minibatches))
         if ranking is not None:
             final_kl = ranking_kl(model, ranking).item()
             if not math.isfinite(final_kl):
@@ -228,7 +252,7 @@ class MKPTrainer:
         seed_everything(c.seed + m, c.deterministic, c.cpu_threads)
         rng = np.random.default_rng(c.seed + m)
         model = MKPModel(self.model_config).to(self.device)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=c.learning_rate, weight_decay=0.0)
+        optimizer = build_optimizer(model, c)
         start, best = 1, -float("inf")
         history = []
         saved = None
@@ -239,15 +263,24 @@ class MKPTrainer:
             if saved["generator_config"] != config_dict(self.generator_config):
                 raise ValueError("Resume generator config differs")
             old = saved["train_config"]
+            if old.get("ranking_loss_type", "soft_bce") != c.ranking_loss_type:
+                raise ValueError("Resume ranking loss differs; use --ranking-loss-type soft_bce for legacy runs, "
+                                 "or start a separate experiment for regret_margin")
+            if (c.ranking_loss_type == "regret_margin"
+                    and old.get("ranking_margin_cap", 1.) != c.ranking_margin_cap):
+                raise ValueError("Resume requires unchanged ranking_margin_cap")
+            validate_actor_resume(c, old)
             for key in ("train_num_items", "validation_seed", "validation_instances_per_shape", "seed"):
                 if old[key] != config_dict(c)[key]:
                     raise ValueError(f"Resume requires unchanged {key}")
-            optimizer = torch.optim.AdamW(model.parameters(), lr=c.learning_rate, weight_decay=0.0)
+            optimizer = build_optimizer(model, c)
             optimizer.load_state_dict(saved["optimizer_state"])
             for group in optimizer.param_groups:
-                group["lr"] = c.learning_rate
+                group["lr"] = c.actor_learning_rate if group.get("name") == "actor" else c.learning_rate
             start, best = saved["update"] + 1, saved["best_validation_return"]
-            history = saved.get("diagnostics_history", [])
+            history = [{key: value for key, value in row.items()
+                        if key != "validation_improvement_pct"}
+                       for row in saved.get("diagnostics_history", [])]
             if not history:
                 self.logger.warning("M=%d resume checkpoint has no diagnostics history; convergence evidence starts at update=%d",
                                     m, start)
@@ -256,12 +289,10 @@ class MKPTrainer:
         runtime = configure_training_runtime(model, c, self.device)
         write_json(self.run_dir / f"runtime_M{m}.json", runtime)
         self.logger.info("M=%d RUNTIME | %s", m, runtime)
-        # Fixed held-out synthetic validation has an independent RNG and only training N shapes.
+        # Held-out synthetic validation has an independent RNG and only training N shapes.
         vrng = np.random.default_rng(c.validation_seed + m)
         validation = [synthetic_batch(c.validation_instances_per_shape, n, m, self.generator_config,
                                      vrng, self.device) for n in c.train_num_items]
-        fixed_objectives = [construct_solution(data, mode="fixed", model_config=self.model_config)["objective"]
-                            for data in validation]
         if saved:
             rng.bit_generator.state = saved["numpy_generator_state"]
             torch.set_rng_state(saved["torch_rng_state"])
@@ -291,20 +322,18 @@ class MKPTrainer:
                                                  if self.device.type == "cuda" else 0.),
                          gpu_peak_reserved_gib=(torch.cuda.max_memory_reserved(self.device) / GIB
                                                 if self.device.type == "cuda" else 0.))
-            validation_return, improvement = None, None
+            validation_return = None
             improved = False
             if update == start or update % c.validation_every == 0 or update == c.updates:
                 objectives = [construct_solution(d, model)["objective"] for d in validation]
                 validation_return = torch.cat([obj / d[0].sum(-1) for obj, d in zip(objectives, validation)]).mean().item()
-                improvement = torch.cat([100 * (obj - ref) / ref.clamp_min(1)
-                                         for obj, ref in zip(objectives, fixed_objectives)]).mean().item()
                 improved = validation_return > best
                 best = max(best, validation_return)
             row = dict(M=m, N=n, update=update, transitions=int(rollout["active"].sum()),
                        objective_mean=rollout["objective"].mean().item(),
                        normalized_return=(rollout["objective"] / data[0].sum(-1)).mean().item(),
                        utilization=rollout["utilization"].item(), **stats, **rollout.get("combination_metrics", {}),
-                       validation_return=validation_return, validation_improvement_pct=improvement,
+                       validation_return=validation_return,
                        best_validation_return=best, elapsed_seconds=time.perf_counter() - began)
             history.append(row)
             with (self.run_dir / "metrics.csv").open("a", newline="", encoding="utf-8") as f:
@@ -323,6 +352,12 @@ class MKPTrainer:
                              stats.get("ranking_loss", 0.), stats.get("ranking_accuracy", 0.),
                              stats.get("ranking_abs_return_gap", 0.), stats.get("ranking_standard_error", 0.),
                              stats.get("ranking_kl", 0.), stats.get("ranking_label_seconds", 0.))
+            if c.actor_continuation_guard:
+                self.logger.info("M=%d update=%d ACTOR_GUARD | rejected=%d states=%d delta=%.8f "
+                                 "max_KL=%.6f applied_minibatches=%d/%d",
+                                 m, update, stats["actor_guard_rejected"], stats["actor_guard_states"],
+                                 stats["actor_guard_delta"], stats["actor_guard_max_kl"],
+                                 stats["actor_minibatches_applied"], stats["minibatches"])
             self.logger.info("M=%d update=%d SPEED | rollout=%.2fs labels=%.2fs PPO=%.2fs "
                              "cache=%.3fGiB build=%.2fs peak_allocated=%.2fGiB peak_reserved=%.2fGiB",
                              m, update, stats["rollout_seconds"], stats.get("ranking_label_seconds", 0.),
@@ -360,7 +395,7 @@ class MKPTrainer:
         write_json(self.run_dir / f"diagnostics_history_M{m}.json", history)
         self.logger.info("M=%d CONVERGENCE_FINAL | status=%s plateau_start_update=%s confirmation_update=%s "
                          "best_update=%s best_validation_return=%.8f observed_through_update=%s | "
-                         "fixed synthetic validation; not a claim about Chu gap convergence",
+                         "learned_dynamic synthetic greedy validation; not a claim about Chu gap convergence",
                          m, report["status"], report["plateau_start_update"], report["confirmation_update"],
                          report["best_update"], report["best_validation_return"], report["observed_through_update"])
         paths = plot_training(history, report, c, self.run_dir / "plots", m)
@@ -377,6 +412,11 @@ def main(argv=None):
     parser.add_argument("--batch-size", type=int, default=defaults.batch_size)
     parser.add_argument("--minibatch-size", type=int, default=defaults.minibatch_size)
     parser.add_argument("--device", default=defaults.device)
+    parser.add_argument("--actor-learning-rate", type=float, default=defaults.actor_learning_rate)
+    parser.add_argument("--actor-continuation-guard", action=argparse.BooleanOptionalAction,
+                        default=defaults.actor_continuation_guard)
+    parser.add_argument("--actor-guard-states", type=int, default=defaults.actor_guard_states)
+    parser.add_argument("--actor-guard-tolerance", type=float, default=defaults.actor_guard_tolerance)
     parser.add_argument("--performance-profile", choices=("auto", "reference", "memory24"),
                         default=defaults.performance_profile)
     parser.add_argument("--feature-cache-gib", type=float, default=defaults.feature_cache_gib)
@@ -387,6 +427,8 @@ def main(argv=None):
     parser.add_argument("--checkpoint-dir", type=Path, default=defaults.checkpoint_dir)
     parser.add_argument("--runs-dir", type=Path, default=defaults.runs_dir)
     parser.add_argument("--ranking-coefficient", type=float, default=defaults.ranking_coefficient)
+    parser.add_argument("--ranking-loss-type", choices=("soft_bce", "regret_margin"), default=defaults.ranking_loss_type)
+    parser.add_argument("--ranking-margin-cap", type=float, default=defaults.ranking_margin_cap)
     parser.add_argument("--ranking-states", type=int, default=defaults.ranking_states)
     parser.add_argument("--ranking-pool-size", type=int, default=defaults.ranking_pool_size)
     parser.add_argument("--ranking-repeats", type=int, default=defaults.ranking_repeats)
@@ -422,7 +464,12 @@ def main(argv=None):
     config = TrainConfig(num_resources=tuple(args.resources), train_num_items=tuple(args.train_items),
                          updates=args.updates, batch_size=args.batch_size, minibatch_size=args.minibatch_size,
                          device=args.device, seed=args.seed, checkpoint_dir=args.checkpoint_dir,
+                         actor_learning_rate=args.actor_learning_rate,
+                         actor_continuation_guard=args.actor_continuation_guard,
+                         actor_guard_states=args.actor_guard_states,
+                         actor_guard_tolerance=args.actor_guard_tolerance,
                          runs_dir=args.runs_dir, ranking_coefficient=args.ranking_coefficient,
+                         ranking_loss_type=args.ranking_loss_type, ranking_margin_cap=args.ranking_margin_cap,
                          ranking_states=args.ranking_states, ranking_pool_size=args.ranking_pool_size,
                          ranking_repeats=args.ranking_repeats, performance_profile=args.performance_profile,
                          ranking_target_mode=args.ranking_target_mode, ranking_candidates=args.ranking_candidates,

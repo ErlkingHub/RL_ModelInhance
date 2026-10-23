@@ -16,6 +16,7 @@ from mkp_Model import BipartiteBlock, MKPModel, WeakDecoder
 from mkp_ranking import ranking_objective
 from mkp_utils import atomic_checkpoint, load_checkpoint
 from test_opportunity_ranking import critical_state, labeled_batch
+from mkp_test_helpers import synthetic_theta
 
 
 class ControllerAttentionTests(unittest.TestCase):
@@ -173,7 +174,7 @@ class ControllerAttentionTests(unittest.TestCase):
     def test_independent_ablations_and_unchanged_decoder_theta_contract(self):
         state = critical_state()
         expected_decoder = WeakDecoder(self.config)
-        theta = expected_decoder.fixed_theta(state)
+        theta = synthetic_theta(state, self.config)
         theta.opportunity_weight.fill_(.7)
         theta.reserve_weight.fill_(.3)
         expected = expected_decoder(state, theta)
@@ -204,7 +205,7 @@ class ControllerAttentionTests(unittest.TestCase):
                   "--actor-relation-chunk-size", "3", "--actor-relation-bandwidth", ".07",
                   "--actor-similarity-bandwidth", ".2"])
         train, config = trainer.call_args.args
-        self.assertEqual(train.checkpoint_dir.name, "resource_strategy_v2")
+        self.assertEqual(train.checkpoint_dir.name, "regret_margin_v2")
         self.assertFalse(config.actor_postdecision_features or config.actor_pair_attention
                          or config.actor_contrast_pooling or config.actor_feasible_attention)
         self.assertEqual(config.actor_relation_chunk_size, 3)

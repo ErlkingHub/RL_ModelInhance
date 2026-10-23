@@ -8,6 +8,7 @@ CHECKPOINT_VERSION = 5
 CONTROLLER_VERSION = "combination_theta_v5"
 DECODER_VERSION = "second_order_density_v5"
 ACTOR_ARCHITECTURE_VERSION = "resource_strategy_v2"
+TRAINING_VARIANT_VERSION = "regret_margin_v2"
 
 @dataclass
 class TrainConfig:
@@ -18,6 +19,11 @@ class TrainConfig:
     minibatch_size: int = 128
     ppo_epochs: int = 3
     learning_rate: float = 1e-4
+    # Opt-in Actor controls; None/False preserve the original PPO update.
+    actor_learning_rate: float | None = None
+    actor_continuation_guard: bool = False
+    actor_guard_states: int = 8
+    actor_guard_tolerance: float = 0.0
     gamma: float = 1.0
     gae_lambda: float = 0.95
     clip_ratio: float = 0.2
@@ -43,11 +49,14 @@ class TrainConfig:
     ranking_se_multiplier: float = 1.0
     ranking_return_scale: float = 0.002
     ranking_score_scale: float = 0.2
+    # Correct only consequential ordering violations; soft_bce reproduces v1.
+    ranking_loss_type: str = "regret_margin"
+    ranking_margin_cap: float = 1.0
     ranking_greedy_weight: float = 0.5
     validation_every: int = 25
     validation_instances_per_shape: int = 64
     checkpoint_every: int = 100
-    # Operational performance plateau on fixed synthetic validation (not Chu gap).
+    # Operational performance plateau on held-out synthetic validation (not Chu gap).
     convergence_min_updates: int = 1000
     convergence_patience_updates: int = 1000
     convergence_min_evaluations: int = 20
@@ -64,14 +73,14 @@ class TrainConfig:
     cache_headroom_gib: float = 6.0
     feature_cache_batch_size: int = 64
     runs_dir: Path = field(default_factory=lambda: ROOT / "runs")
-    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / ACTOR_ARCHITECTURE_VERSION)
+    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / TRAINING_VARIANT_VERSION)
 
     def __post_init__(self):
         counts = (self.updates, self.batch_size, self.minibatch_size, self.ppo_epochs,
                   self.validation_every, self.validation_instances_per_shape,
                   self.checkpoint_every, self.cpu_threads, self.convergence_min_updates,
                   self.convergence_patience_updates, self.convergence_min_evaluations,
-                  self.plot_smoothing_updates, self.feature_cache_batch_size)
+                  self.plot_smoothing_updates, self.feature_cache_batch_size, self.actor_guard_states)
         if any(x < 1 for x in counts):
             raise ValueError("Training counts/intervals must be positive")
         if self.performance_profile not in ("auto", "reference", "memory24"):
@@ -86,6 +95,15 @@ class TrainConfig:
             raise ValueError("Invalid GAE parameters")
         if self.learning_rate <= 0 or not 0 < self.clip_ratio < 1 or self.value_clip <= 0:
             raise ValueError("Invalid optimizer or PPO parameters")
+        if self.actor_learning_rate is not None and (
+                not math.isfinite(self.actor_learning_rate) or self.actor_learning_rate <= 0):
+            raise ValueError("actor_learning_rate must be finite and positive, or None")
+        if not isinstance(self.actor_continuation_guard, bool):
+            raise ValueError("actor_continuation_guard must be boolean")
+        if type(self.actor_guard_states) is not int:
+            raise ValueError("actor_guard_states must be a positive integer")
+        if not math.isfinite(self.actor_guard_tolerance) or self.actor_guard_tolerance < 0:
+            raise ValueError("actor_guard_tolerance must be finite and nonnegative")
         if min(self.value_coefficient, self.entropy_coefficient,
                self.constraint_aux_coefficient) < 0:
             raise ValueError("Loss coefficients must be nonnegative")
@@ -100,6 +118,10 @@ class TrainConfig:
             raise ValueError("Ranking batch sizes must be positive")
         if self.ranking_target_mode not in ("dense_greedy", "legacy_mixed"):
             raise ValueError("ranking_target_mode must be dense_greedy or legacy_mixed")
+        if self.ranking_loss_type not in ("soft_bce", "regret_margin"):
+            raise ValueError("ranking_loss_type must be soft_bce or regret_margin")
+        if not math.isfinite(self.ranking_margin_cap) or self.ranking_margin_cap <= 0:
+            raise ValueError("ranking_margin_cap must be finite and positive")
         if not math.isfinite(self.ranking_confidence_floor) or not 0 < self.ranking_confidence_floor <= 1:
             raise ValueError("ranking_confidence_floor must lie in (0, 1]")
         if self.ranking_pool_size < self.ranking_states or self.ranking_candidates < 2 or self.ranking_repeats < 2:
@@ -237,21 +259,18 @@ class BenchmarkConfig:
     dataset: Path = field(default_factory=lambda: ROOT / "MKP_dataset" / "Benchmarks_Chu.mat")
     num_resources: tuple[int, ...] = (5, 10)
     num_items: tuple[int, ...] = (100, 250, 500)
-    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / ACTOR_ARCHITECTURE_VERSION)
+    checkpoint_dir: Path = field(default_factory=lambda: ROOT / "checkpoints" / TRAINING_VARIANT_VERSION)
     results_dir: Path = field(default_factory=lambda: ROOT / "results")
     checkpoint_tag: str = "best"
     device: str = "auto"
     seed: int = 20260910
-    # Greedy single trajectory is the primary result. Sampling is opt-in and separate.
-    sample_rollouts: int = 0
-    sample_batch_size: int = 32
     target_gap_pct: float = 0.1
     feasibility_tolerance: float = 1e-7
     cpu_threads: int = 4
 
     def __post_init__(self):
-        if self.sample_rollouts < 0 or self.sample_batch_size < 1 or self.cpu_threads < 1:
-            raise ValueError("Invalid benchmark budget")
+        if self.cpu_threads < 1:
+            raise ValueError("Benchmark CPU threads must be positive")
         if self.target_gap_pct < 0 or self.feasibility_tolerance < 0:
             raise ValueError("Invalid benchmark tolerances")
         if not self.num_resources or not self.num_items or min(*self.num_resources, *self.num_items) < 1:

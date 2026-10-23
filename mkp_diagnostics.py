@@ -25,7 +25,7 @@ def convergence_report(rows, config, *, complete=False):
         raise ValueError("Validation updates must be strictly increasing")
     report = {
         "status": "insufficient_history", "training_complete": complete,
-        "scope": "fixed_synthetic_greedy_validation_only",
+        "scope": "synthetic_learned_dynamic_greedy_validation_only",
         "criterion": "All trailing validation returns within tolerance of global best; sufficient span and evaluations",
         "tolerance_pct": config.convergence_tolerance_pct,
         "patience_updates": config.convergence_patience_updates,
@@ -88,7 +88,7 @@ def plot_training(rows, report, config, output_dir, m):
     output_dir.mkdir(parents=True, exist_ok=True)
     updates = np.array([int(row["update"]) for row in rows])
     panels = [
-        ("Greedy synthetic validation", ["validation_return", "best_validation_return"]),
+        ("Greedy learned_dynamic validation", ["validation_return", "best_validation_return"]),
         ("Training return", ["normalized_return"]),
         ("Policy entropy (normalized)", ["entropy"]),
         ("PPO policy loss", ["policy_loss"]),
@@ -150,7 +150,7 @@ def plot_training(rows, report, config, output_dir, m):
     points = (f" | plateau start={report['plateau_start_update']}, confirmation={report['confirmation_update']}"
               if report["plateau_start_update"] is not None else " | no confirmed convergence point")
     fig.suptitle(f"M={m} | {status}{points}\n"
-                 f"Synthetic validation tolerance={config.convergence_tolerance_pct}% relative to best; "
+                 f"Learned_dynamic synthetic validation tolerance={config.convergence_tolerance_pct}% relative to best; "
                  f"patience={config.convergence_patience_updates} updates (not Chu gap convergence)", fontsize=14)
     paths = [output_dir / f"training_M{m}.{ext}" for ext in ("png", "svg")]
     try:

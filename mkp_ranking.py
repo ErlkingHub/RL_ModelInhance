@@ -337,13 +337,42 @@ def collect_ranking_batch(model, data, rollout, config, seed):
         model.train(was_training)
 
 
+def regret_margin_losses(margin, delta, return_scale, margin_cap=1.):
+    """Bounded return-weighted corrections; satisfied comparisons have no push.
+
+    ``delta`` is a frozen policy-continuation estimate, not an exact Q value.
+    Its sign chooses the preferred ordering. Its magnitude sets a bounded
+    required score margin and a bounded importance weight. Labels never receive
+    gradients, and equal-return comparisons impose no preference.
+    """
+    if not math.isfinite(return_scale) or return_scale <= 0:
+        raise ValueError("Ranking return scale must be finite and positive")
+    if not math.isfinite(margin_cap) or margin_cap <= 0:
+        raise ValueError("Ranking margin cap must be finite and positive")
+    delta = delta.detach().to(margin)
+    strength = delta.abs() / return_scale
+    required = strength.clamp(max=margin_cap)
+    weight = strength.clamp(max=1.)
+    violation = F.relu(required - delta.sign() * margin)
+    # Huber avoids an extreme wrong score dominating all other comparisons
+    # through a quadratic derivative. d(loss)/d(margin) is bounded by weight;
+    # network-parameter gradients still use the normal global gradient clip.
+    return F.smooth_l1_loss(violation, torch.zeros_like(violation), reduction="none") * weight
+
+
 def ranking_objective(model, batch, config):
     policy, theta, _ = model.policy(batch.state)
     # Temperature cannot satisfy ranking supervision merely by sharpening logits.
     margin = ((policy.log_prob(batch.left) - policy.log_prob(batch.right))
               * theta.temperature / config.ranking_score_scale)
-    target = torch.sigmoid(batch.delta / config.ranking_return_scale).to(margin)
-    losses = F.binary_cross_entropy_with_logits(margin, target, reduction="none")
+    if config.ranking_loss_type == "soft_bce":
+        target = torch.sigmoid(batch.delta.detach() / config.ranking_return_scale).to(margin)
+        losses = F.binary_cross_entropy_with_logits(margin, target, reduction="none")
+    elif config.ranking_loss_type == "regret_margin":
+        losses = regret_margin_losses(margin, batch.delta, config.ranking_return_scale,
+                                      config.ranking_margin_cap)
+    else:
+        raise ValueError("Unknown ranking loss type")
     # Mean rather than renormalizing by confidence sum: if every greedy label
     # conflicts with stochastic continuation, their aggregate gradient is smaller.
     weighted = losses if batch.confidence is None else losses * batch.confidence.to(losses)

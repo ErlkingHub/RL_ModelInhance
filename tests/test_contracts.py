@@ -12,6 +12,7 @@ from mkp_env import MKPEnv, MKPState
 from mkp_Model import CandidatePolicy, MKPModel, StrategyTheta, WeakDecoder
 from mkp_Trainer import generalized_advantage
 from mkp_utils import atomic_checkpoint, load_checkpoint
+from mkp_test_helpers import synthetic_theta
 
 
 def toy_state(device="cpu"):
@@ -58,7 +59,7 @@ class Contracts(unittest.TestCase):
     def test_decoder_agrees_with_literal_formula(self):
         state = toy_state().state
         decoder = WeakDecoder(self.config)
-        theta = decoder.fixed_theta(state)
+        theta = synthetic_theta(state, self.config)
         actual = decoder(state, theta)
         rows, cols = state.feasible.nonzero(as_tuple=True)
         w, c, rem = state.weights.float()[rows, cols], state.capacities.float()[rows], state.remaining.float()[rows]

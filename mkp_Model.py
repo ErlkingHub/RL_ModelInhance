@@ -322,16 +322,6 @@ class WeakDecoder:
     def __init__(self, config: ModelConfig):
         self.config = config
 
-    def fixed_theta(self, state):
-        b, m = state.capacities.shape
-        device = state.profits.device
-        return StrategyTheta(torch.ones(b, m, device=device), torch.ones(b, device=device),
-                             torch.ones(b, device=device), torch.full((b,), 0.1, device=device),
-                             torch.full((b,), 0.2, device=device),
-                             torch.zeros(b, device=device), torch.zeros(b, device=device),
-                             torch.zeros(b, m, m, device=device),
-                             torch.zeros(b, len(self.config.companion_scales), device=device))
-
     @torch.no_grad()
     def opportunity_features(self, state, owners, items):
         """Transparent pairwise capacity arithmetic, not a rollout or learned Q head.
